@@ -1,0 +1,29 @@
+# Configuration parameters for LaserScan Object Detector (optimized for YDLIDAR X4)
+# Target platform: F1/10 scale vehicle / Jetson Orin Nano
+
+/**:
+  ros__parameters:
+    # Sensor filters
+    min_range: 0.15                  # YDLIDAR X4 blind zone is 0.12m, set to 0.15m to avoid chassis reflection
+    max_range: 8.0                   # Max tracking range (X4 physically supports up to 10m)
+    
+    # Clustering (Dietmayer sequential JDC)
+    beta_incidence_deg: 12.0         # Angle of incidence threshold (typically 10-15 deg)
+    sigma_r: 0.02                    # Standard deviation of scan range measurements (approx 2cm for X4)
+    min_jump_distance: 0.15          # Minimum clustering distance (in meters) between separate objects
+    max_jump_distance: 1.0           # Maximum clustering distance threshold
+    min_cluster_points: 4            # Ignore clusters with fewer than 4 points (noise filter)
+    max_cluster_points: 150          # Limit maximum cluster point count
+    
+    # Shape Fitting & Post-processing
+    use_convex_hull: true            # Output convex hulls for dynamic obstacles (ideal for MPC/CBF)
+    split_threshold: 0.04            # Split distance (in meters) for split-and-merge wall line extraction
+    
+    # Multi-Target Tracking
+    max_association_distance: 0.8    # Gate distance (in meters) for tracking data association
+    min_track_age: 3                 # Required consecutive observed frames before publishing track
+    max_missed_frames: 5             # Number of missed updates before a track is deleted
+    
+    # Visualization & Debug
+    publish_debug_pointcloud: true   # Publish unique color-coded cluster PointCloud2
+    publish_debug_markers: true      # Publish cylinders, cubes, arrows, and ID labels in RViz2
