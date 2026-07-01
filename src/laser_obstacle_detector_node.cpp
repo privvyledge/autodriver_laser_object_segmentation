@@ -13,6 +13,10 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
+#include <tf2/utils.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <vector>
 #include <cmath>
@@ -38,7 +42,7 @@ public:
         declare_parameter("min_jump_distance", 0.1);
         declare_parameter("max_jump_distance", 1.0);
         declare_parameter("min_cluster_points", 3);
-        declare_parameter("max_cluster_points", 150);
+        declare_parameter("max_cluster_points", 2000);
         declare_parameter("use_convex_hull", true);
         declare_parameter("split_threshold", 0.05);
         declare_parameter("max_association_distance", 1.0);
@@ -46,6 +50,15 @@ public:
         declare_parameter("max_missed_frames", 5);
         declare_parameter("publish_debug_pointcloud", true);
         declare_parameter("publish_debug_markers", true);
+        declare_parameter("use_median_filter", true);
+        declare_parameter("association_method", "hungarian");
+        declare_parameter("circle_residual_ratio", 0.12);
+        declare_parameter("max_circle_radius", 1.0);
+        declare_parameter("corner_angle_min_deg", 65.0);
+        declare_parameter("corner_angle_max_deg", 115.0);
+        declare_parameter("shape_smoothing_alpha", 0.5);
+        declare_parameter("tracking_frame", "odom");
+        declare_parameter("publish_unconfirmed", true);
 
         // Get initial parameters
         double beta_rad = get_parameter("beta_incidence_deg").as_double() * M_PI / 180.0;
@@ -64,10 +77,21 @@ public:
             get_parameter("max_association_distance").as_double(),
             get_parameter("min_track_age").as_int(),
             get_parameter("max_missed_frames").as_int(),
-            0.1 // dt
+            0.1, // dt
+            get_parameter("use_median_filter").as_bool(),
+            get_parameter("association_method").as_string(),
+            get_parameter("circle_residual_ratio").as_double(),
+            get_parameter("max_circle_radius").as_double(),
+            get_parameter("corner_angle_min_deg").as_double(),
+            get_parameter("corner_angle_max_deg").as_double(),
+            get_parameter("shape_smoothing_alpha").as_double()
         );
 
         last_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+
+        // Initialize TF2 buffer and listener
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         // Subscriptions
         scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
@@ -96,16 +120,66 @@ private:
     void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
     {
         // Update dt dynamically
+        double dt = core_->dt;
         rclcpp::Time current_stamp(msg->header.stamp);
         if (last_stamp_.nanoseconds() > 0)
         {
-            double dt = (current_stamp.nanoseconds() - last_stamp_.nanoseconds()) / 1e9;
-            if (dt > 0.001)
+            double calc_dt = (current_stamp.nanoseconds() - last_stamp_.nanoseconds()) / 1e9;
+            if (calc_dt > 0.001)
             {
-                core_->dt = dt;
+                dt = calc_dt;
             }
         }
         last_stamp_ = current_stamp;
+
+        // Clamp dt to [1e-3, 1.0]
+        dt = std::max(1.0e-3, std::min(dt, 1.0));
+
+        // Look up transform for ego-motion-aware tracking
+        std::vector<double> sensor_pose;
+        std::string tracking_frame = get_parameter("tracking_frame").as_string();
+        std::string out_frame_id = msg->header.frame_id;
+
+        if (!tracking_frame.empty())
+        {
+            try
+            {
+                geometry_msgs::msg::TransformStamped trans = tf_buffer_->lookupTransform(
+                    tracking_frame,
+                    msg->header.frame_id,
+                    msg->header.stamp,
+                    rclcpp::Duration::from_seconds(0.02)
+                );
+
+                double tx = trans.transform.translation.x;
+                double ty = trans.transform.translation.y;
+
+                // Quaternion to yaw
+                double qx = trans.transform.rotation.x;
+                double qy = trans.transform.rotation.y;
+                double qz = trans.transform.rotation.z;
+                double qw = trans.transform.rotation.w;
+
+                double siny_cosp = 2.0 * (qw * qz + qx * qy);
+                double cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz);
+                double yaw = std::atan2(siny_cosp, cosy_cosp);
+
+                sensor_pose = {tx, ty, yaw};
+                out_frame_id = tracking_frame;
+            }
+            catch (const tf2::TransformException& ex)
+            {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(),
+                    *get_clock(),
+                    5000, // 5 seconds
+                    "TF lookup failed from '%s' to '%s': %s. Falling back to sensor frame.",
+                    tracking_frame.c_str(),
+                    msg->header.frame_id.c_str(),
+                    ex.what()
+                );
+            }
+        }
 
         // Synchronize core parameters
         core_->min_range = get_parameter("min_range").as_double();
@@ -121,20 +195,49 @@ private:
         core_->max_association_dist = get_parameter("max_association_distance").as_double();
         core_->min_track_age = get_parameter("min_track_age").as_int();
         core_->max_missed_frames = get_parameter("max_missed_frames").as_int();
+        core_->use_median_filter = get_parameter("use_median_filter").as_bool();
+        core_->association_method = get_parameter("association_method").as_string();
+        core_->circle_residual_ratio = get_parameter("circle_residual_ratio").as_double();
+        core_->max_circle_radius = get_parameter("max_circle_radius").as_double();
+        core_->corner_angle_min_deg = get_parameter("corner_angle_min_deg").as_double();
+        core_->corner_angle_max_deg = get_parameter("corner_angle_max_deg").as_double();
+        core_->shape_smoothing_alpha = get_parameter("shape_smoothing_alpha").as_double();
 
         // Core processing
-        auto [confirmed_tracks, clusters] = core_->process(msg->ranges, msg->angle_min, msg->angle_increment);
+        auto [active_tracks, clusters] = core_->process(
+            msg->ranges,
+            msg->angle_min,
+            msg->angle_increment,
+            dt,
+            sensor_pose
+        );
+
+        bool publish_unconfirmed = get_parameter("publish_unconfirmed").as_bool();
+        std::vector<Track> tracks_to_publish;
+        for (const auto& track : active_tracks)
+        {
+            if (publish_unconfirmed || track.is_confirmed)
+            {
+                tracks_to_publish.push_back(track);
+            }
+        }
+
+        std_msgs::msg::Header out_header;
+        out_header.stamp = msg->header.stamp;
+        out_header.frame_id = out_frame_id;
 
         // 1. Publish Obstacles
         derived_object_msgs::msg::ObjectArray obj_array;
-        obj_array.header = msg->header;
+        obj_array.header = out_header;
 
-        for (const auto& track : confirmed_tracks)
+        for (const auto& track : tracks_to_publish)
         {
             derived_object_msgs::msg::Object obj;
-            obj.header = msg->header;
+            obj.header = out_header;
             obj.id = track.id;
-            obj.detection_level = derived_object_msgs::msg::Object::OBJECT_TRACKED;
+            obj.detection_level = track.is_confirmed ? 
+                static_cast<uint8_t>(derived_object_msgs::msg::Object::OBJECT_TRACKED) : 
+                static_cast<uint8_t>(derived_object_msgs::msg::Object::OBJECT_DETECTED);
             obj.object_classified = false;
 
             // Position
@@ -194,7 +297,7 @@ private:
 
         obstacles_pub_->publish(obj_array);
 
-        // 2. Publish Debug Clusters PointCloud2
+        // 2. Publish Debug Clusters PointCloud2 (debug pointcloud stays in the sensor frame)
         if (publish_pc_ && !clusters.empty())
         {
             auto pc_msg = make_color_pc2(msg->header, clusters);
@@ -204,7 +307,7 @@ private:
         // 3. Publish Debug Markers
         if (publish_markers_)
         {
-            publish_debug_markers(msg->header, confirmed_tracks);
+            publish_debug_markers(out_header, tracks_to_publish);
         }
     }
 
@@ -451,6 +554,8 @@ private:
 
     std::unique_ptr<LaserObstacleDetectorCore> core_;
     rclcpp::Time last_stamp_;
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
     
     // Subscriptions
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;

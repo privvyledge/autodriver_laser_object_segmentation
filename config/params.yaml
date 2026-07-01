@@ -13,16 +13,27 @@
     min_jump_distance: 0.15          # Minimum clustering distance (in meters) between separate objects
     max_jump_distance: 1.0           # Maximum clustering distance threshold
     min_cluster_points: 4            # Ignore clusters with fewer than 4 points (noise filter)
-    max_cluster_points: 150          # Limit maximum cluster point count
+    max_cluster_points: 2000         # Limit maximum cluster point count (raised to survive walls)
+    
+    # Preprocessing
+    use_median_filter: true          # Skip if scan pre-filtered (laser_filters)
     
     # Shape Fitting & Post-processing
     use_convex_hull: true            # Output convex hulls for dynamic obstacles (ideal for MPC/CBF)
     split_threshold: 0.04            # Split distance (in meters) for split-and-merge wall line extraction
+    circle_residual_ratio: 0.12      # Circle acceptance residual/radius ratio
+    max_circle_radius: 1.0           # Max radius (meters) to accept as circle
+    corner_angle_min_deg: 65.0       # Lower angle bound for L-shape corner fitting
+    corner_angle_max_deg: 115.0      # Upper angle bound for L-shape corner fitting
     
     # Multi-Target Tracking
+    tracking_frame: "odom"           # Frame for KF tracking + output (poses & velocities)
+    association_method: "hungarian"  # hungarian (recommended) or greedy
+    publish_unconfirmed: true        # Publish tentative tracks as OBJECT_DETECTED
     max_association_distance: 0.8    # Gate distance (in meters) for tracking data association
     min_track_age: 3                 # Required consecutive observed frames before publishing track
     max_missed_frames: 5             # Number of missed updates before a track is deleted
+    shape_smoothing_alpha: 0.5       # EMA smoothing coefficient on shape dimensions (1.0 = off)
     
     # Visualization & Debug
     publish_debug_pointcloud: true   # Publish unique color-coded cluster PointCloud2

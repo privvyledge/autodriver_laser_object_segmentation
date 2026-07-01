@@ -39,13 +39,20 @@ public:
         double min_jump_distance = 0.1,
         double max_jump_distance = 1.0,
         uint32_t min_cluster_points = 3,
-        uint32_t max_cluster_points = 150,
+        uint32_t max_cluster_points = 2000,
         bool use_convex_hull = true,
         double split_threshold = 0.05,
         double max_association_distance = 1.0,
         uint32_t min_track_age = 3,
         uint32_t max_missed_frames = 5,
-        double dt = 0.1
+        double dt = 0.1,
+        bool use_median_filter = true,
+        std::string association_method = "hungarian",
+        double circle_residual_ratio = 0.12,
+        double max_circle_radius = 1.0,
+        double corner_angle_min_deg = 65.0,
+        double corner_angle_max_deg = 115.0,
+        double shape_smoothing_alpha = 0.5
     );
 
     ~LaserObstacleDetectorCore() = default;
@@ -65,13 +72,27 @@ public:
     uint32_t min_track_age;
     uint32_t max_missed_frames;
     double dt;
+    bool use_median_filter;
+    std::string association_method;
+    double circle_residual_ratio;
+    double max_circle_radius;
+    double corner_angle_min_deg;
+    double corner_angle_max_deg;
+    double shape_smoothing_alpha;
 
     // Core Processing Pipeline
     std::pair<std::vector<Track>, std::vector<std::vector<Point2D>>> process(
         const std::vector<float>& ranges,
         double angle_min,
-        double angle_increment
+        double angle_increment,
+        double dt,
+        const std::vector<double>& sensor_pose = {}
     );
+
+    // Helper functions exposed for C-linkage testing
+    static std::vector<Point2D> convex_hull_jarvis(const std::vector<Point2D>& points);
+    static void fit_obb(const std::vector<Point2D>& points, Point2D& center, double& length, double& width, double& yaw);
+    std::vector<int> solve_hungarian(const std::vector<std::vector<double>>& cost_matrix);
 
 private:
     std::vector<Track> tracks_;
@@ -100,17 +121,24 @@ private:
 
     // Geometry & Shape fitting
     static void fit_circle_kasa(const std::vector<Point2D>& points, Point2D& center, double& radius);
-    static void fit_obb(const std::vector<Point2D>& points, Point2D& center, double& length, double& width, double& yaw);
     static double distance_to_line(const Point2D& p, const Point2D& p1, const Point2D& p2);
     std::vector<std::vector<Point2D>> split_and_merge(const std::vector<Point2D>& points);
-    static std::vector<Point2D> convex_hull_jarvis(const std::vector<Point2D>& points);
 
     // Tracking helpers
-    void predict_tracks();
-    void associate_and_update(const std::vector<std::tuple<uint8_t, Point2D, std::vector<double>, std::vector<Point2D>>>& detections);
-    void update_track_kf(Track& track, const Point2D& detection_centroid);
+    void predict_tracks(double dt);
+    void associate_and_update(
+        const std::vector<std::tuple<uint8_t, Point2D, std::vector<double>, std::vector<Point2D>>>& detections,
+        double dt
+    );
+    void update_track_kf(Track& track, const Point2D& detection_centroid, double dt);
 };
 
 } // namespace autodriver_laser_object_segmentation
+
+extern "C" {
+    void test_convex_hull(const double* points_x, const double* points_y, int n, double* hull_x, double* hull_y, int* hull_n);
+    void test_obb(const double* points_x, const double* points_y, int n, double* cx, double* cy, double* length, double* width, double* yaw);
+    void test_hungarian(const double* cost_matrix, int rows, int cols, int* row_ind, int* col_ind, int* count);
+}
 
 #endif // AUTODRIVER_LASER_OBJECT_SEGMENTATION__LASER_OBSTACLE_DETECTOR_CORE_HPP_

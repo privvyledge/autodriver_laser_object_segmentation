@@ -1,9 +1,12 @@
 import numpy as np
 import math
+import scipy.spatial
+import scipy.signal
+import scipy.optimize
 
 
 class Track:
-    def __init__(self, track_id, position, shape_type, shape_dims, polygon, dt):
+    def __init__(self, track_id, position, shape_type, shape_dims, polygon, dt, shape_smoothing_alpha=1.0):
         """
         Keeps track of an individual obstacle using a constant-velocity Kalman Filter.
         State vector x = [px, py, vx, vy]^T
@@ -28,6 +31,7 @@ class Track:
         self.shape_dims = shape_dims     # list: [radius] or [length, width, height]
         self.polygon = polygon           # List of [x, y] coordinates representing shape boundary
         
+        self.shape_smoothing_alpha = shape_smoothing_alpha
         self.age = 1
         self.missed_frames = 0
         self.is_confirmed = False
@@ -85,9 +89,38 @@ class Track:
         I = np.eye(4)
         self.P = np.dot(I - np.dot(K, H), self.P)
         
-        # Update shape properties
+        # Smooth shape properties
+        if self.shape_smoothing_alpha < 1.0 and self.shape_type == shape_type and len(self.shape_dims) == len(shape_dims):
+            alpha = self.shape_smoothing_alpha
+            if shape_type == 0:  # CIRCLE
+                r_smooth = alpha * shape_dims[0] + (1.0 - alpha) * self.shape_dims[0]
+                self.shape_dims = [r_smooth]
+            elif shape_type == 1:  # BOX
+                l_smooth = alpha * shape_dims[0] + (1.0 - alpha) * self.shape_dims[0]
+                w_smooth = alpha * shape_dims[1] + (1.0 - alpha) * self.shape_dims[1]
+                
+                # Yaw blending with pi-symmetry
+                y_prev = self.shape_dims[2]
+                y_curr = shape_dims[2]
+                
+                cos_prev = math.cos(2.0 * y_prev)
+                sin_prev = math.sin(2.0 * y_prev)
+                cos_curr = math.cos(2.0 * y_curr)
+                sin_curr = math.sin(2.0 * y_curr)
+                
+                cos_smooth = alpha * cos_curr + (1.0 - alpha) * cos_prev
+                sin_smooth = alpha * sin_curr + (1.0 - alpha) * sin_prev
+                
+                yaw_smooth = 0.5 * math.atan2(sin_smooth, cos_smooth)
+                yaw_smooth = yaw_smooth % math.pi
+                
+                self.shape_dims = [l_smooth, w_smooth, yaw_smooth]
+            else:
+                self.shape_dims = shape_dims
+        else:
+            self.shape_dims = shape_dims
+            
         self.shape_type = shape_type
-        self.shape_dims = shape_dims
         self.polygon = polygon
         
         self.age += 1
@@ -103,13 +136,20 @@ class LaserObstacleDetectorCore:
                  min_jump_distance=0.1,
                  max_jump_distance=1.0,
                  min_cluster_points=3,
-                 max_cluster_points=150,
+                 max_cluster_points=2000,
                  use_convex_hull=True,
                  split_threshold=0.05,
                  max_association_distance=1.0,
                  min_track_age=3,
                  max_missed_frames=5,
-                 dt=0.1):
+                 dt=0.1,
+                 use_median_filter=True,
+                 association_method="hungarian",
+                 circle_residual_ratio=0.12,
+                 max_circle_radius=1.0,
+                 corner_angle_min_deg=65.0,
+                 corner_angle_max_deg=115.0,
+                 shape_smoothing_alpha=0.5):
         """
         Core LaserScan object detector and tracker library. ROS-independent.
         """
@@ -127,13 +167,20 @@ class LaserObstacleDetectorCore:
         self.min_track_age = min_track_age
         self.max_missed_frames = max_missed_frames
         self.dt = dt
+        self.use_median_filter = use_median_filter
+        self.association_method = association_method
+        self.circle_residual_ratio = circle_residual_ratio
+        self.max_circle_radius = max_circle_radius
+        self.corner_angle_min_deg = corner_angle_min_deg
+        self.corner_angle_max_deg = corner_angle_max_deg
+        self.shape_smoothing_alpha = shape_smoothing_alpha
         
         self.tracks = []
         self.next_track_id = 1
 
     def preprocess_scan(self, ranges, angle_min, angle_increment):
         """
-        Applies a median filter and projects valid points to 2D Cartesian space.
+        Applies an optional median filter and projects valid points to 2D Cartesian space.
         Returns:
             points: N x 2 numpy array of (x, y) coordinates
             valid_indices: array of indices matching the original scan angles
@@ -141,10 +188,14 @@ class LaserObstacleDetectorCore:
         ranges = np.array(ranges)
         num_beams = len(ranges)
         
-        # 1D Median filter for salt-and-pepper noise (window size = 3)
-        filtered_ranges = np.copy(ranges)
-        for i in range(1, num_beams - 1):
-            filtered_ranges[i] = np.median(ranges[i-1:i+2])
+        if self.use_median_filter:
+            # Mask invalid (inf/nan) before filtering to prevent smearing
+            process_ranges = np.copy(ranges)
+            invalid_mask = np.isnan(process_ranges) | np.isinf(process_ranges) | (process_ranges < self.min_range) | (process_ranges > self.max_range)
+            process_ranges[invalid_mask] = self.max_range * 2.0
+            filtered_ranges = scipy.signal.medfilt(process_ranges, kernel_size=3)
+        else:
+            filtered_ranges = ranges
             
         # Cartesian conversion
         angles = angle_min + np.arange(num_beams) * angle_increment
@@ -169,80 +220,51 @@ class LaserObstacleDetectorCore:
     def cluster_points(self, points, valid_indices, angle_increment):
         """
         Performs sequential Jump Distance Clustering (JDC) with an adaptive threshold.
-        Since scan points are ordered radially, adjacencies are analyzed sequentially.
+        Fully vectorized over adjacent valid beam pairs.
         """
         N = len(points)
         if N == 0:
             return []
+        if N == 1:
+            if self.min_cluster_points <= 1 <= self.max_cluster_points:
+                return [points]
+            return []
             
-        clusters = []
-        current_cluster = [0]
+        # Vectorized sequential clustering
+        seg = points[1:] - points[:-1]
+        dist = np.linalg.norm(seg, axis=1)
+        idx_gap = valid_indices[1:] - valid_indices[:-1]
+        d_theta = angle_increment * idx_gap
+        r_prev = np.linalg.norm(points[:-1], axis=1)
         
-        for i in range(1, N):
-            idx_prev = valid_indices[i-1]
-            idx_curr = valid_indices[i]
-            
-            # Check if points are adjacent in terms of scan index
-            # In a full scan, they are adjacent if diff == 1
-            if idx_curr - idx_prev > 2:  # allow at most 1 skipped beam in between
-                # Large gap in angle, start new cluster
-                if len(current_cluster) >= self.min_cluster_points:
-                    clusters.append(current_cluster)
-                current_cluster = [i]
-                continue
-                
-            # Compute Euclidean distance
-            p_prev = points[i-1]
-            p_curr = points[i]
-            dist = np.linalg.norm(p_curr - p_prev)
-            
-            # Adaptive Jump Distance (Dietmayer formula)
-            r_prev = np.linalg.norm(p_prev)
-            d_theta = angle_increment * (idx_curr - idx_prev)
-            
-            denom = math.sin(self.beta - d_theta)
-            if denom > 0.01:
-                d_th = r_prev * (math.sin(d_theta) / denom) + 3.0 * self.sigma_r
-            else:
-                d_th = self.min_jump_distance
-                
-            # Clamp threshold
-            d_th = np.clip(d_th, self.min_jump_distance, self.max_jump_distance)
-            
-            if dist > d_th:
-                # Segment jump! Start new cluster
-                if len(current_cluster) >= self.min_cluster_points:
-                    clusters.append(current_cluster)
-                current_cluster = [i]
-            else:
-                current_cluster.append(i)
-                
-        # Append the last cluster
-        if len(current_cluster) >= self.min_cluster_points:
-            clusters.append(current_cluster)
-            
+        denom = np.sin(self.beta - d_theta)
+        d_th = np.where(denom > 0.01, r_prev * np.sin(d_theta)/denom + 3.0 * self.sigma_r, self.min_jump_distance)
+        d_th = np.clip(d_th, self.min_jump_distance, self.max_jump_distance)
+        
+        break_mask = (idx_gap > 2) | (dist > d_th)
+        split_indices = np.where(break_mask)[0] + 1
+        
+        clusters = [list(c) for c in np.split(np.arange(N), split_indices)]
+        
         # Check wrap-around (link last and first cluster if adjacent in 360 scan)
         if len(clusters) > 1:
             p_first = points[clusters[0][0]]
             p_last = points[clusters[-1][-1]]
-            dist = np.linalg.norm(p_first - p_last)
+            dist_val = np.linalg.norm(p_first - p_last)
             
-            # Compute adaptive threshold for wrap-around
             idx_first = valid_indices[clusters[0][0]]
             idx_last = valid_indices[clusters[-1][-1]]
             total_beams = int(2.0 * math.pi / angle_increment)
             
-            # Distance in beams considering wrap-around
             d_idx = (idx_first - idx_last) % total_beams
             if d_idx <= 2: # adjacent
                 r_last = np.linalg.norm(p_last)
-                d_theta = angle_increment * d_idx
-                denom = math.sin(self.beta - d_theta)
-                d_th = r_last * (math.sin(d_theta) / denom) + 3.0 * self.sigma_r if denom > 0.01 else self.min_jump_distance
-                d_th = np.clip(d_th, self.min_jump_distance, self.max_jump_distance)
+                d_theta_wrap = angle_increment * d_idx
+                denom_wrap = math.sin(self.beta - d_theta_wrap)
+                d_th_wrap = r_last * (math.sin(d_theta_wrap) / denom_wrap) + 3.0 * self.sigma_r if denom_wrap > 0.01 else self.min_jump_distance
+                d_th_wrap = np.clip(d_th_wrap, self.min_jump_distance, self.max_jump_distance)
                 
-                if dist <= d_th:
-                    # Merge last cluster into first
+                if dist_val <= d_th_wrap:
                     clusters[0] = clusters[-1] + clusters[0]
                     clusters.pop()
                     
@@ -291,20 +313,43 @@ class LaserObstacleDetectorCore:
     @staticmethod
     def fit_obb(points):
         """
-        Fits an Oriented Bounding Box (OBB) using orientation search.
+        Fits an Oriented Bounding Box (OBB) using rotating calipers on the convex hull.
         Returns: center [xc, yc], size [length, width], orientation yaw angle
         """
+        N = len(points)
+        if N == 0:
+            return np.array([0.0, 0.0]), np.array([0.1, 0.1]), 0.0
+        if N == 1:
+            return points[0], np.array([0.1, 0.1]), 0.0
+            
+        try:
+            hull = scipy.spatial.ConvexHull(points)
+            hull_points = points[hull.vertices]
+        except Exception:
+            # Collinear / degenerate: fallback to extreme points
+            p_min = np.argmin(points[:, 0])
+            p_max = np.argmax(points[:, 0])
+            if np.allclose(points[p_min], points[p_max]):
+                p_max = np.argmax(points[:, 1])
+            hull_points = points[[p_min, p_max]]
+            
+        V = len(hull_points)
         best_area = float('inf')
         best_center = np.mean(points, axis=0)
         best_size = np.array([0.1, 0.1])
         best_angle = 0.0
         
-        # Search orientations in 2-degree increments from 0 to 90
-        angles = np.radians(np.arange(0, 90, 2))
-        for angle in angles:
+        for i in range(V):
+            p1 = hull_points[i]
+            p2 = hull_points[(i + 1) % V]
+            edge = p2 - p1
+            edge_len = np.linalg.norm(edge)
+            if edge_len < 1e-6:
+                continue
+            angle = math.atan2(edge[1], edge[0])
+            
             cos_a = math.cos(angle)
             sin_a = math.sin(angle)
-            # Rotation matrix (from global to local frame)
             R = np.array([
                 [cos_a,  sin_a],
                 [-sin_a, cos_a]
@@ -319,16 +364,15 @@ class LaserObstacleDetectorCore:
             if area < best_area:
                 best_area = area
                 best_size = size
-                # Rotated center
-                rot_center = min_p + size / 2.0
-                # Transform back to global frame
-                best_center = np.dot(R.T, rot_center)
+                best_center = np.dot(R.T, min_p + size / 2.0)
                 best_angle = angle
                 
         # Ensure length > width for consistency
         if best_size[0] < best_size[1]:
             best_size = np.array([best_size[1], best_size[0]])
             best_angle = (best_angle + math.pi / 2.0) % math.pi
+        else:
+            best_angle = best_angle % math.pi
             
         return best_center, best_size, best_angle
 
@@ -339,6 +383,14 @@ class LaserObstacleDetectorCore:
         if v_norm < 1e-6:
             return np.linalg.norm(p - p1)
         return abs(v[0] * (p1[1] - p[1]) - v[1] * (p1[0] - p[0])) / v_norm
+
+    @staticmethod
+    def distance_to_line_vectorized(pts, p1, p2):
+        v = p2 - p1
+        v_norm = np.linalg.norm(v)
+        if v_norm < 1e-6:
+            return np.linalg.norm(pts - p1, axis=1)
+        return np.abs(v[0] * (p1[1] - pts[:, 1]) - v[1] * (p1[0] - pts[:, 0])) / v_norm
 
     def split_and_merge(self, points):
         """
@@ -352,16 +404,16 @@ class LaserObstacleDetectorCore:
                 return []
             p1 = pts[0]
             p2 = pts[-1]
+            if len(pts) == 2:
+                return [[p1, p2]]
+                
+            dists = self.distance_to_line_vectorized(pts[1:-1], p1, p2)
+            if len(dists) == 0:
+                return [[p1, p2]]
+                
+            max_idx = np.argmax(dists) + 1
+            max_dist = dists[max_idx - 1]
             
-            max_dist = -1.0
-            max_idx = -1
-            
-            for i in range(1, len(pts) - 1):
-                dist = self.distance_to_line(pts[i], p1, p2)
-                if dist > max_dist:
-                    max_dist = dist
-                    max_idx = i
-                    
             if max_dist > self.split_threshold:
                 left = split_recursive(pts[:max_idx + 1])
                 right = split_recursive(pts[max_idx:])
@@ -374,36 +426,23 @@ class LaserObstacleDetectorCore:
     @staticmethod
     def convex_hull_jarvis(points):
         """
-        Gift wrapping algorithm to find 2D Convex Hull.
+        Wrapper around SciPy ConvexHull. Enforces counterclockwise winding.
         """
         N = len(points)
         if N < 3:
             return points
-            
-        # Leftmost point
-        start_idx = np.argmin(points[:, 0])
-        
-        hull = []
-        p = start_idx
-        while True:
-            hull.append(p)
-            q = (p + 1) % N
-            for i in range(N):
-                # PQ x PI cross product
-                cross = (points[q][0] - points[p][0]) * (points[i][1] - points[p][1]) - \
-                        (points[q][1] - points[p][1]) * (points[i][0] - points[p][0])
-                if cross > 0:
-                    q = i
-                elif cross == 0:
-                    dist_q = (points[q][0] - points[p][0])**2 + (points[q][1] - points[p][1])**2
-                    dist_i = (points[i][0] - points[p][0])**2 + (points[i][1] - points[p][1])**2
-                    if dist_i > dist_q:
-                        q = i
-            p = q
-            if p == start_idx:
-                break
-                
-        return points[hull]
+        try:
+            hull = scipy.spatial.ConvexHull(points)
+            return points[hull.vertices]
+        except Exception:
+            # Collinear / degenerate fallback
+            p_min = np.argmin(points[:, 0])
+            p_max = np.argmax(points[:, 0])
+            if np.allclose(points[p_min], points[p_max]):
+                p_max = np.argmax(points[:, 1])
+            if p_min == p_max:
+                return points[[p_min]]
+            return points[[p_min, p_max]]
 
     def fit_shape(self, points):
         """
@@ -420,15 +459,13 @@ class LaserObstacleDetectorCore:
         # 1. Circle Fitting Test
         circle_center, radius = self.fit_circle_kasa(points)
         distances_to_center = np.linalg.norm(points - circle_center, axis=1)
-        mean_dist = np.mean(distances_to_center)
         circle_residual = np.mean(np.abs(distances_to_center - radius))
         
         # Check if the points fit a circular arc cleanly
-        is_circle = (circle_residual / radius < 0.12) and (radius < 1.0)
+        is_circle = (circle_residual / radius < self.circle_residual_ratio) and (radius < self.max_circle_radius)
         
         if is_circle:
             # CIRCLE representation
-            # We can create a polygon approximation of the circle for controllers
             poly_points = []
             for angle in np.linspace(0, 2.0 * math.pi, 16, endpoint=False):
                 poly_points.append([
@@ -459,13 +496,8 @@ class LaserObstacleDetectorCore:
             
             if v1_norm > 0.01 and v2_norm > 0.01:
                 cos_theta = np.dot(v1, v2) / (v1_norm * v2_norm)
-                # Angle in radians between segments (dot product of direction vectors)
-                # If orthog, cos_theta ~ 0
                 angle_rad = abs(math.acos(np.clip(cos_theta, -1.0, 1.0)))
-                # A 90 deg corner in lines translates to v1 and v2 being perpendicular.
-                # Since v1 = p_mid - p_start, and v2 = p_end - p_mid,
-                # if they meet at 90 deg, the angle between their direction vectors is ~ 90 deg.
-                if math.radians(65.0) <= angle_rad <= math.radians(115.0):
+                if math.radians(self.corner_angle_min_deg) <= angle_rad <= math.radians(self.corner_angle_max_deg):
                     # CORNER representation
                     return 3, p_mid, [], [p_start.tolist(), p_mid.tolist(), p_end.tolist()]
                     
@@ -498,46 +530,74 @@ class LaserObstacleDetectorCore:
         else:
             return 1, box_center, [box_size[0], box_size[1], box_yaw], global_corners.tolist()
 
-    def associate_and_track(self, detected_obstacles):
+    def associate_and_track(self, detected_obstacles, dt=None):
         """
-        Updates trackers with new detections using Greedy nearest-neighbor association.
+        Updates trackers with new detections using Greedy or Hungarian association.
         detected_obstacles: list of tuples: (shape_type, centroid, dims, polygon)
         """
+        if dt is None:
+            dt = self.dt
+            
         # Predict all existing tracks
         for track in self.tracks:
-            track.predict(self.dt)
+            track.predict(dt)
             
+        if len(detected_obstacles) == 0:
+            active_tracks = []
+            for track in self.tracks:
+                track.missed_frames += 1
+                if track.missed_frames <= self.max_missed_frames:
+                    active_tracks.append(track)
+            self.tracks = active_tracks
+            return
+            
+        det_centroids = np.array([det[1] for det in detected_obstacles])
+        track_positions = np.array([track.x[:2] for track in self.tracks])
+        
         matched_detections = set()
         matched_tracks = set()
         
-        # Greedy Association based on distance
-        associations = []
-        for d_idx, (_, det_centroid, _, _) in enumerate(detected_obstacles):
-            for t_idx, track in enumerate(self.tracks):
-                dist = np.linalg.norm(det_centroid - track.x[:2])
-                if dist < self.max_association_dist:
-                    associations.append((dist, d_idx, t_idx))
-                    
-        # Sort by distance
-        associations.sort(key=lambda x: x[0])
-        
-        for dist, d_idx, t_idx in associations:
-            if d_idx not in matched_detections and t_idx not in matched_tracks:
-                matched_detections.add(d_idx)
-                matched_tracks.add(t_idx)
-                # Update track with this detection
-                shape_type, centroid, dims, polygon = detected_obstacles[d_idx]
-                self.tracks[t_idx].update(centroid, shape_type, dims, polygon)
+        if len(self.tracks) > 0:
+            C = scipy.spatial.distance.cdist(det_centroids, track_positions)
+            
+            if self.association_method == "hungarian":
+                C_gated = np.copy(C)
+                gate_mask = C_gated > self.max_association_dist
+                C_gated[gate_mask] = 1e9
                 
-        # Manage unmatched tracks (increment missed frame counts)
+                row_ind, col_ind = scipy.optimize.linear_sum_assignment(C_gated)
+                
+                for r, c in zip(row_ind, col_ind):
+                    if C[r, c] < self.max_association_dist:
+                        matched_detections.add(r)
+                        matched_tracks.add(c)
+                        shape_type, centroid, dims, polygon = detected_obstacles[r]
+                        self.tracks[c].update(centroid, shape_type, dims, polygon)
+            else:
+                # Greedy Association
+                associations = []
+                for d_idx in range(len(detected_obstacles)):
+                    for t_idx in range(len(self.tracks)):
+                        dist = C[d_idx, t_idx]
+                        if dist < self.max_association_dist:
+                            associations.append((dist, d_idx, t_idx))
+                            
+                associations.sort(key=lambda x: x[0])
+                
+                for dist, d_idx, t_idx in associations:
+                    if d_idx not in matched_detections and t_idx not in matched_tracks:
+                        matched_detections.add(d_idx)
+                        matched_tracks.add(t_idx)
+                        shape_type, centroid, dims, polygon = detected_obstacles[d_idx]
+                        self.tracks[t_idx].update(centroid, shape_type, dims, polygon)
+                        
+        # Manage unmatched tracks
         active_tracks = []
         for t_idx, track in enumerate(self.tracks):
             if t_idx not in matched_tracks:
                 track.missed_frames += 1
-                
             if track.missed_frames <= self.max_missed_frames:
                 active_tracks.append(track)
-                
         self.tracks = active_tracks
         
         # Manage unmatched detections (spawn new tracks)
@@ -549,39 +609,66 @@ class LaserObstacleDetectorCore:
                     shape_type,
                     dims,
                     polygon,
-                    self.dt
+                    dt,
+                    self.shape_smoothing_alpha
                 )
                 self.next_track_id += 1
                 self.tracks.append(new_track)
 
-    def process(self, ranges, angle_min, angle_increment):
+    def process(self, ranges, angle_min, angle_increment, dt=None, sensor_pose=None):
         """
         Main execution pipeline call.
         Returns:
             list of active and confirmed Track objects
             list of raw clusters in Cartesian space (for debug output)
         """
-        # 1. Preprocessing
+        if dt is None:
+            dt = self.dt
+        else:
+            self.dt = dt
+            
+        # 1. Preprocessing (sensor frame)
         points, valid_indices = self.preprocess_scan(ranges, angle_min, angle_increment)
         
-        # 2. Clustering
+        # 2. Clustering (sensor frame)
         clusters = self.cluster_points(points, valid_indices, angle_increment)
         
-        # 3. Shape Fitting
+        # 3. Shape Fitting (sensor frame)
         detections = []
         for cluster in clusters:
             shape_type, centroid, dims, polygon = self.fit_shape(cluster)
+            
+            # Transform detections into tracking frame if pose provided
+            if sensor_pose is not None:
+                tx, ty, yaw = sensor_pose
+                cos_y = math.cos(yaw)
+                sin_y = math.sin(yaw)
+                
+                # Transform centroid
+                cx = centroid[0] * cos_y - centroid[1] * sin_y + tx
+                cy = centroid[0] * sin_y + centroid[1] * cos_y + ty
+                centroid = np.array([cx, cy])
+                
+                # Transform polygon
+                transformed_poly = []
+                for pt in polygon:
+                    px = pt[0] * cos_y - pt[1] * sin_y + tx
+                    py = pt[0] * sin_y + pt[1] * cos_y + ty
+                    transformed_poly.append([px, py])
+                polygon = transformed_poly
+                
+                # Transform OBB yaw
+                if shape_type == 1:
+                    box_yaw = (dims[2] + yaw) % math.pi
+                    dims = [dims[0], dims[1], box_yaw]
+                    
             detections.append((shape_type, centroid, dims, polygon))
             
-        # 4. Tracking
-        self.associate_and_track(detections)
+        # 4. Tracking (tracking frame)
+        self.associate_and_track(detections, dt)
         
-        # Filter confirmed tracks for downstream output
-        confirmed_tracks = []
+        # Update confirmation state
         for track in self.tracks:
-            # Promote track after min_track_age frames
-            if track.age >= self.min_track_age:
-                track.is_confirmed = True
-                confirmed_tracks.append(track)
+            track.is_confirmed = (track.age >= self.min_track_age)
                 
-        return confirmed_tracks, clusters
+        return self.tracks, clusters

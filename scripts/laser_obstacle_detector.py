@@ -6,7 +6,8 @@ from derived_object_msgs.msg import Object, ObjectArray
 from shape_msgs.msg import SolidPrimitive
 from geometry_msgs.msg import Point, Vector3, Quaternion, Polygon, Point32
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Header
+from tf2_ros import Buffer, TransformListener
 
 import numpy as np
 import struct
@@ -26,7 +27,7 @@ class LaserObstacleDetectorNode(Node):
         self.declare_parameter('min_jump_distance', 0.1)
         self.declare_parameter('max_jump_distance', 1.0)
         self.declare_parameter('min_cluster_points', 3)
-        self.declare_parameter('max_cluster_points', 150)
+        self.declare_parameter('max_cluster_points', 2000)
         self.declare_parameter('use_convex_hull', True)
         self.declare_parameter('split_threshold', 0.05)
         self.declare_parameter('max_association_distance', 1.0)
@@ -34,6 +35,15 @@ class LaserObstacleDetectorNode(Node):
         self.declare_parameter('max_missed_frames', 5)
         self.declare_parameter('publish_debug_pointcloud', True)
         self.declare_parameter('publish_debug_markers', True)
+        self.declare_parameter('use_median_filter', True)
+        self.declare_parameter('association_method', 'hungarian')
+        self.declare_parameter('circle_residual_ratio', 0.12)
+        self.declare_parameter('max_circle_radius', 1.0)
+        self.declare_parameter('corner_angle_min_deg', 65.0)
+        self.declare_parameter('corner_angle_max_deg', 115.0)
+        self.declare_parameter('shape_smoothing_alpha', 0.5)
+        self.declare_parameter('tracking_frame', 'odom')
+        self.declare_parameter('publish_unconfirmed', True)
         
         # Initialize Core
         beta_rad = math.radians(self.get_parameter('beta_incidence_deg').value)
@@ -51,10 +61,19 @@ class LaserObstacleDetectorNode(Node):
             max_association_distance=self.get_parameter('max_association_distance').value,
             min_track_age=self.get_parameter('min_track_age').value,
             max_missed_frames=self.get_parameter('max_missed_frames').value,
-            dt=0.1 # initial guess, will update dynamically
+            dt=0.1, # initial guess, will update dynamically
+            use_median_filter=self.get_parameter('use_median_filter').value,
+            association_method=self.get_parameter('association_method').value,
+            circle_residual_ratio=self.get_parameter('circle_residual_ratio').value,
+            max_circle_radius=self.get_parameter('max_circle_radius').value,
+            corner_angle_min_deg=self.get_parameter('corner_angle_min_deg').value,
+            corner_angle_max_deg=self.get_parameter('corner_angle_max_deg').value,
+            shape_smoothing_alpha=self.get_parameter('shape_smoothing_alpha').value
         )
         
         self.last_stamp = None
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         
         # Subscriptions
         self.scan_sub = self.create_subscription(
@@ -91,13 +110,54 @@ class LaserObstacleDetectorNode(Node):
 
     def scan_callback(self, msg: LaserScan):
         # Calculate dynamic dt
+        dt = self.core.dt
         current_stamp = rclpy.time.Time.from_msg(msg.header.stamp)
         if self.last_stamp is not None:
-            dt = (current_stamp.nanoseconds - self.last_stamp.nanoseconds) / 1e9
-            if dt > 0.001:
-                self.core.dt = dt
+            calc_dt = (current_stamp.nanoseconds - self.last_stamp.nanoseconds) / 1e9
+            if calc_dt > 0.001:
+                dt = calc_dt
         self.last_stamp = current_stamp
         
+        # Clamp dt to sane range [1e-3, 1.0]
+        dt = max(1e-3, min(dt, 1.0))
+        
+        # Look up transform for ego-motion-aware tracking
+        sensor_pose = None
+        tracking_frame = self.get_parameter('tracking_frame').value
+        out_frame_id = msg.header.frame_id
+        
+        if tracking_frame:
+            try:
+                # Target frame: tracking_frame, source frame: msg.header.frame_id
+                trans = self.tf_buffer.lookup_transform(
+                    tracking_frame,
+                    msg.header.frame_id,
+                    msg.header.stamp,
+                    timeout=rclpy.duration.Duration(seconds=0.02)
+                )
+                
+                tx = trans.transform.translation.x
+                ty = trans.transform.translation.y
+                
+                # Quaternion to yaw
+                qx = trans.transform.rotation.x
+                qy = trans.transform.rotation.y
+                qz = trans.transform.rotation.z
+                qw = trans.transform.rotation.w
+                
+                siny_cosp = 2.0 * (qw * qz + qx * qy)
+                cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+                yaw = math.atan2(siny_cosp, cosy_cosp)
+                
+                sensor_pose = (tx, ty, yaw)
+                out_frame_id = tracking_frame
+            except Exception as e:
+                # Log a throttled warning on fallback
+                self.get_logger().warning(
+                    f"TF lookup failed from '{tracking_frame}' to '{msg.header.frame_id}': {e}. Falling back to sensor frame.",
+                    throttle_duration_sec=5.0
+                )
+                
         # Update core parameters dynamically (if updated via dynamic reconfigure / parameters)
         self.core.min_range = self.get_parameter('min_range').value
         self.core.max_range = self.get_parameter('max_range').value
@@ -112,23 +172,40 @@ class LaserObstacleDetectorNode(Node):
         self.core.max_association_dist = self.get_parameter('max_association_distance').value
         self.core.min_track_age = self.get_parameter('min_track_age').value
         self.core.max_missed_frames = self.get_parameter('max_missed_frames').value
+        self.core.use_median_filter = self.get_parameter('use_median_filter').value
+        self.core.association_method = self.get_parameter('association_method').value
+        self.core.circle_residual_ratio = self.get_parameter('circle_residual_ratio').value
+        self.core.max_circle_radius = self.get_parameter('max_circle_radius').value
+        self.core.corner_angle_min_deg = self.get_parameter('corner_angle_min_deg').value
+        self.core.corner_angle_max_deg = self.get_parameter('corner_angle_max_deg').value
+        self.core.shape_smoothing_alpha = self.get_parameter('shape_smoothing_alpha').value
         
         # Process scan
-        confirmed_tracks, clusters = self.core.process(
+        active_tracks, clusters = self.core.process(
             msg.ranges,
             msg.angle_min,
-            msg.angle_increment
+            msg.angle_increment,
+            dt=dt,
+            sensor_pose=sensor_pose
         )
+        
+        publish_unconfirmed = self.get_parameter('publish_unconfirmed').value
+        if publish_unconfirmed:
+            tracks_to_publish = active_tracks
+        else:
+            tracks_to_publish = [t for t in active_tracks if t.is_confirmed]
+            
+        out_header = Header(stamp=msg.header.stamp, frame_id=out_frame_id)
         
         # 1. Publish Obstacles
         obj_array = ObjectArray()
-        obj_array.header = msg.header
+        obj_array.header = out_header
         
-        for track in confirmed_tracks:
+        for track in tracks_to_publish:
             obj = Object()
-            obj.header = msg.header
+            obj.header = out_header
             obj.id = track.id
-            obj.detection_level = Object.TRACKED
+            obj.detection_level = Object.OBJECT_TRACKED if track.is_confirmed else Object.OBJECT_DETECTED
             obj.object_classified = False
             
             # Position (X, Y from state vector, Z=0)
@@ -137,7 +214,6 @@ class LaserObstacleDetectorNode(Node):
             # Orientation
             if track.shape_type == 1: # BOX
                 yaw = track.shape_dims[2]
-                # Convert yaw to quaternion
                 cy = math.cos(yaw * 0.5)
                 sy = math.sin(yaw * 0.5)
                 obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=sy, w=cy)
@@ -151,14 +227,11 @@ class LaserObstacleDetectorNode(Node):
             # Shape
             if track.shape_type == 0: # CIRCLE
                 obj.shape.type = SolidPrimitive.CYLINDER
-                # Cylinder dimensions: height, radius
                 obj.shape.dimensions = [0.5, track.shape_dims[0]]
             elif track.shape_type == 1: # BOX
                 obj.shape.type = SolidPrimitive.BOX
-                # Box dimensions: X, Y, Z
                 obj.shape.dimensions = [track.shape_dims[0], track.shape_dims[1], 0.5]
-            # LINE (2) and CORNER (3) do not have basic SolidPrimitives, we rely on polygon
-            
+                
             # Polygon
             poly = Polygon()
             for pt in track.polygon:
@@ -169,14 +242,14 @@ class LaserObstacleDetectorNode(Node):
             
         self.obstacles_pub.publish(obj_array)
         
-        # 2. Publish Debug PointCloud
+        # 2. Publish Debug PointCloud (debug pointcloud stays in the sensor frame)
         if self.publish_pc and len(clusters) > 0:
             pc_msg = self.make_color_pc2(msg.header, clusters)
             self.pc_pub.publish(pc_msg)
             
         # 3. Publish Debug Markers
         if self.publish_markers:
-            self.publish_debug_markers(msg.header, confirmed_tracks)
+            self.publish_debug_markers(out_header, tracks_to_publish)
 
     def make_color_pc2(self, header, clusters):
         fields = [

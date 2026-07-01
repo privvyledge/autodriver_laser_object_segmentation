@@ -3,11 +3,27 @@ import numpy as np
 import math
 import sys
 import os
+import ctypes
+import scipy.optimize
+import scipy.spatial
 
 # Include package folder in python search path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from autodriver_laser_object_segmentation.laser_obstacle_detector_core import LaserObstacleDetectorCore
+
+def load_cpp_lib():
+    paths = [
+        os.path.expanduser('~/ros2_ws/install/autodriver_laser_object_segmentation/lib/liblaser_obstacle_detector_core_lib.so'),
+        '/home/privvyledge/ros2_ws/install/autodriver_laser_object_segmentation/lib/liblaser_obstacle_detector_core_lib.so'
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                return ctypes.CDLL(p)
+            except Exception:
+                pass
+    return None
 
 class TestLaserObstacleDetectorCore(unittest.TestCase):
     def setUp(self):
@@ -174,6 +190,262 @@ class TestLaserObstacleDetectorCore(unittest.TestCase):
         track = self.detector.tracks[0]
         # Velocity vx should be close to 1.0 m/s after 10 updates
         self.assertAlmostEqual(track.x[2], 1.0, delta=0.2)
+
+    def test_wall_survival(self):
+        # 200 points along a straight line: [1.0, 2.0] to [5.0, 2.0]
+        pts = np.column_stack((
+            np.linspace(1.0, 5.0, 200),
+            np.ones(200) * 2.0
+        ))
+        shape_type, shape_center, shape_dims, poly = self.detector.fit_shape(pts)
+        self.assertEqual(shape_type, 2) # LINE
+        self.assertEqual(len(poly), 2)
+
+    def test_vectorized_clustering_parity(self):
+        def reference_cluster_points(detector, points, valid_indices, angle_increment):
+            N = len(points)
+            if N == 0:
+                return []
+            clusters = []
+            current_cluster = [0]
+            for i in range(1, N):
+                idx_prev = valid_indices[i-1]
+                idx_curr = valid_indices[i]
+                if idx_curr - idx_prev > 2:
+                    if len(current_cluster) >= detector.min_cluster_points:
+                        clusters.append(current_cluster)
+                    current_cluster = [i]
+                    continue
+                p_prev = points[i-1]
+                p_curr = points[i]
+                dist = np.linalg.norm(p_curr - p_prev)
+                r_prev = np.linalg.norm(p_prev)
+                d_theta = angle_increment * (idx_curr - idx_prev)
+                denom = math.sin(detector.beta - d_theta)
+                if denom > 0.01:
+                    d_th = r_prev * (math.sin(d_theta) / denom) + 3.0 * detector.sigma_r
+                else:
+                    d_th = detector.min_jump_distance
+                d_th = np.clip(d_th, detector.min_jump_distance, detector.max_jump_distance)
+                if dist > d_th:
+                    if len(current_cluster) >= detector.min_cluster_points:
+                        clusters.append(current_cluster)
+                    current_cluster = [i]
+                else:
+                    current_cluster.append(i)
+            if len(current_cluster) >= detector.min_cluster_points:
+                clusters.append(current_cluster)
+            
+            filtered = []
+            for c in clusters:
+                if detector.min_cluster_points <= len(c) <= detector.max_cluster_points:
+                    filtered.append(points[c])
+            return filtered
+
+        angles = np.linspace(-np.pi, np.pi, 360)
+        ranges = np.sin(angles) * 3.0 + 4.0
+        points, valid_indices = self.detector.preprocess_scan(ranges, -np.pi, 2*np.pi/360)
+        
+        ref_clusters = reference_cluster_points(self.detector, points, valid_indices, 2*np.pi/360)
+        vec_clusters = self.detector.cluster_points(points, valid_indices, 2*np.pi/360)
+        
+        self.assertEqual(len(ref_clusters), len(vec_clusters))
+        for c_ref, c_vec in zip(ref_clusters, vec_clusters):
+            self.assertTrue(np.allclose(c_ref, c_vec))
+
+    def test_hull_parity_and_robustness(self):
+        pts_collinear = np.column_stack((
+            np.linspace(1.0, 5.0, 10),
+            np.ones(10) * 2.0
+        ))
+        hull = self.detector.convex_hull_jarvis(pts_collinear)
+        self.assertTrue(len(hull) <= 2)
+        
+        np.random.seed(42)
+        pts_rand = np.random.rand(20, 2)
+        hull_rand = self.detector.convex_hull_jarvis(pts_rand)
+        
+        for i in range(len(hull_rand)):
+            p1 = hull_rand[i]
+            p2 = hull_rand[(i + 1) % len(hull_rand)]
+            p3 = hull_rand[(i + 2) % len(hull_rand)]
+            cross = (p2[0] - p1[0]) * (p3[1] - p2[1]) - (p2[1] - p1[1]) * (p3[0] - p2[0])
+            self.assertTrue(cross >= -1e-9)
+            
+        lib = load_cpp_lib()
+        if lib is not None:
+            lib.test_convex_hull.argtypes = [
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_int)
+            ]
+            
+            px = (ctypes.c_double * 20)(*pts_rand[:, 0])
+            py = (ctypes.c_double * 20)(*pts_rand[:, 1])
+            hx = (ctypes.c_double * 20)()
+            hy = (ctypes.c_double * 20)()
+            hn = ctypes.c_int(0)
+            
+            lib.test_convex_hull(px, py, 20, hx, hy, ctypes.byref(hn))
+            cpp_hull = np.column_stack((list(hx)[:hn.value], list(hy)[:hn.value]))
+            
+            self.assertEqual(hn.value, len(hull_rand))
+            for p in hull_rand:
+                dists = np.linalg.norm(cpp_hull - p, axis=1)
+                self.assertTrue(np.any(dists < 1e-5))
+
+    def test_obb_accuracy(self):
+        center = np.array([3.0, 2.0])
+        length, width = 2.0, 0.8
+        yaw = math.pi / 4.0
+        
+        hl, hw = length / 2.0, width / 2.0
+        local_pts = np.array([
+            [-hl, -hw], [hl, -hw], [hl, hw], [-hl, hw],
+            [-hl/2, -hw], [hl/2, -hw], [hl/2, hw], [-hl/2, hw]
+        ])
+        R = np.array([
+            [math.cos(yaw), -math.sin(yaw)],
+            [math.sin(yaw),  math.cos(yaw)]
+        ])
+        pts = np.dot(local_pts, R.T) + center
+        
+        fit_c, fit_size, fit_yaw = self.detector.fit_obb(pts)
+        self.assertAlmostEqual(fit_c[0], center[0], places=2)
+        self.assertAlmostEqual(fit_c[1], center[1], places=2)
+        self.assertAlmostEqual(fit_size[0], length, places=2)
+        self.assertAlmostEqual(fit_size[1], width, places=2)
+        self.assertAlmostEqual(fit_yaw, yaw, delta=math.radians(1.0))
+        
+        lib = load_cpp_lib()
+        if lib is not None:
+            lib.test_obb.argtypes = [
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double)
+            ]
+            px = (ctypes.c_double * len(pts))(*pts[:, 0])
+            py = (ctypes.c_double * len(pts))(*pts[:, 1])
+            cx, cy, clen, cwid, cyaw = ctypes.c_double(0), ctypes.c_double(0), ctypes.c_double(0), ctypes.c_double(0), ctypes.c_double(0)
+            
+            lib.test_obb(px, py, len(pts), ctypes.byref(cx), ctypes.byref(cy), ctypes.byref(clen), ctypes.byref(cwid), ctypes.byref(cyaw))
+            
+            self.assertAlmostEqual(cx.value, fit_c[0], places=5)
+            self.assertAlmostEqual(cy.value, fit_c[1], places=5)
+            self.assertAlmostEqual(clen.value, fit_size[0], places=5)
+            self.assertAlmostEqual(cwid.value, fit_size[1], places=5)
+            self.assertAlmostEqual(cyaw.value, fit_yaw, places=5)
+
+    def test_ego_motion(self):
+        wall_pts_sensor_frame_1 = np.column_stack((
+            np.linspace(1.0, 3.0, 10),
+            np.ones(10) * 2.0
+        ))
+        
+        tx, ty, yaw = 0.1, 0.0, math.radians(5.0)
+        R = np.array([
+            [math.cos(yaw), -math.sin(yaw)],
+            [math.sin(yaw),  math.cos(yaw)]
+        ])
+        wall_pts_tracking = np.column_stack((
+            np.linspace(1.0, 3.0, 10),
+            np.ones(10) * 2.0
+        ))
+        wall_pts_sensor_frame_2 = np.dot(wall_pts_tracking - np.array([tx, ty]), R)
+        
+        self.detector.tracks = []
+        
+        orig_preprocess = self.detector.preprocess_scan
+        orig_cluster = self.detector.cluster_points
+        
+        try:
+            self.detector.preprocess_scan = lambda r, a_min, a_inc: (wall_pts_sensor_frame_1, np.arange(len(wall_pts_sensor_frame_1)))
+            self.detector.cluster_points = lambda p, v_idx, a_inc: [p]
+            tracks1, _ = self.detector.process([1.0]*10, 0.0, 0.1, dt=0.1, sensor_pose=(0.0, 0.0, 0.0))
+            
+            self.detector.preprocess_scan = lambda r, a_min, a_inc: (wall_pts_sensor_frame_2, np.arange(len(wall_pts_sensor_frame_2)))
+            self.detector.cluster_points = lambda p, v_idx, a_inc: [p]
+            tracks2, _ = self.detector.process([1.0]*10, 0.0, 0.1, dt=0.1, sensor_pose=(tx, ty, yaw))
+            
+            self.assertEqual(len(tracks2), 1)
+            vx, vy = tracks2[0].x[2], tracks2[0].x[3]
+            self.assertAlmostEqual(vx, 0.0, delta=0.05)
+            self.assertAlmostEqual(vy, 0.0, delta=0.05)
+        finally:
+            self.detector.preprocess_scan = orig_preprocess
+            self.detector.cluster_points = orig_cluster
+
+    def test_dt_scaling(self):
+        self.detector.tracks = []
+        self.detector.min_track_age = 1
+        
+        det1 = [(0, np.array([2.0, 0.0]), [0.2], [])]
+        self.detector.associate_and_track(det1, dt=0.1)
+        
+        det2 = [(0, np.array([2.1, 0.0]), [0.2], [])]
+        self.detector.associate_and_track(det2, dt=0.1)
+        v1 = self.detector.tracks[0].x[2]
+        
+        self.detector.tracks = []
+        self.detector.associate_and_track(det1, dt=0.05)
+        self.detector.associate_and_track(det2, dt=0.05)
+        v2 = self.detector.tracks[0].x[2]
+        
+        self.assertAlmostEqual(v2, v1 * 2.0, delta=0.2)
+
+    def test_association_method(self):
+        lib = load_cpp_lib()
+        if lib is not None:
+            lib.test_hungarian.argtypes = [
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int)
+            ]
+            cost = np.array([
+                [1.0, 2.0, 0.5],
+                [0.2, 1.5, 3.0],
+                [2.0, 0.1, 1.0]
+            ], dtype=np.float64)
+            
+            row_py, col_py = scipy.optimize.linear_sum_assignment(cost)
+            
+            flat_cost = cost.flatten()
+            c_cost = (ctypes.c_double * 9)(*flat_cost)
+            row_cpp = (ctypes.c_int * 3)()
+            col_cpp = (ctypes.c_int * 3)()
+            count = ctypes.c_int(0)
+            
+            lib.test_hungarian(c_cost, 3, 3, row_cpp, col_cpp, ctypes.byref(count))
+            
+            self.assertEqual(count.value, 3)
+            match_py = {r: c for r, c in zip(row_py, col_py)}
+            for i in range(3):
+                self.assertEqual(col_cpp[i], match_py[row_cpp[i]])
+
+    def test_detection_level(self):
+        self.detector.tracks = []
+        self.detector.min_track_age = 3
+        
+        self.detector.process([3.0]*10, 0.0, 0.1, dt=0.1)
+        self.assertEqual(len(self.detector.tracks), 1)
+        self.assertFalse(self.detector.tracks[0].is_confirmed)
+        
+        self.detector.process([3.0]*10, 0.0, 0.1, dt=0.1)
+        self.assertFalse(self.detector.tracks[0].is_confirmed)
+        
+        self.detector.process([3.0]*10, 0.0, 0.1, dt=0.1)
+        self.assertTrue(self.detector.tracks[0].is_confirmed)
 
 if __name__ == '__main__':
     unittest.main()
