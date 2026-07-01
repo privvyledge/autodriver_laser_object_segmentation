@@ -8,6 +8,11 @@ from geometry_msgs.msg import Point, Vector3, Quaternion, Polygon, Point32
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA, Header
 from tf2_ros import Buffer, TransformListener
+try:
+    from nav2_dynamic_msgs.msg import Obstacle, ObstacleArray
+    NAV2_DYNAMIC_MSGS_AVAILABLE = True
+except ImportError:
+    NAV2_DYNAMIC_MSGS_AVAILABLE = False
 
 import numpy as np
 import struct
@@ -20,6 +25,9 @@ class LaserObstacleDetectorNode(Node):
         super().__init__('laser_obstacle_detector')
         
         # Declare Parameters
+        self.declare_parameter('enable_tracking', True)
+        self.declare_parameter('publish_object_array', True)
+        self.declare_parameter('publish_obstacle_array', False)
         self.declare_parameter('min_range', 0.1)
         self.declare_parameter('max_range', 10.0)
         self.declare_parameter('beta_incidence_deg', 10.0)
@@ -76,11 +84,12 @@ class LaserObstacleDetectorNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
         # Subscriptions
+        from rclpy.qos import qos_profile_sensor_data
         self.scan_sub = self.create_subscription(
             LaserScan,
             'scan',
             self.scan_callback,
-            10
+            qos_profile_sensor_data
         )
         
         # Publishers
@@ -107,6 +116,36 @@ class LaserObstacleDetectorNode(Node):
             )
             
         self.get_logger().info('Laser Obstacle Detector Node initialized.')
+        self._nav2_warned = False
+
+    def pack_nav2_obstacle_msg(self, detection):
+        import uuid
+        shape_type, centroid, dims, polygon = detection
+        obstacle = Obstacle()
+        obstacle.uuid.uuid = list(uuid.uuid4().bytes)
+        obstacle.score = 1.0
+        
+        obstacle.position.x = float(centroid[0])
+        obstacle.position.y = float(centroid[1])
+        obstacle.position.z = 0.0
+        
+        if shape_type == 0:  # CIRCLE
+            obstacle.size.x = float(2 * dims[0])
+            obstacle.size.y = float(2 * dims[0])
+            obstacle.size.z = 0.5
+        elif shape_type == 1:  # BOX
+            obstacle.size.x = float(dims[0])
+            obstacle.size.y = float(dims[1])
+            obstacle.size.z = 0.5
+        else:  # LINE/CORNER
+            pts = np.array(polygon)
+            min_pt = np.min(pts, axis=0)
+            max_pt = np.max(pts, axis=0)
+            obstacle.size.x = max(0.1, float(max_pt[0] - min_pt[0]))
+            obstacle.size.y = max(0.1, float(max_pt[1] - min_pt[1]))
+            obstacle.size.z = 0.5
+            
+        return obstacle
 
     def scan_callback(self, msg: LaserScan):
         # Calculate dynamic dt
@@ -180,67 +219,90 @@ class LaserObstacleDetectorNode(Node):
         self.core.corner_angle_max_deg = self.get_parameter('corner_angle_max_deg').value
         self.core.shape_smoothing_alpha = self.get_parameter('shape_smoothing_alpha').value
         
+        enable_tracking = self.get_parameter('enable_tracking').value
+        publish_object_array = self.get_parameter('publish_object_array').value
+        publish_obstacle_array = self.get_parameter('publish_obstacle_array').value
+
         # Process scan
-        active_tracks, clusters = self.core.process(
+        active_tracks, detections, clusters = self.core.process(
             msg.ranges,
             msg.angle_min,
             msg.angle_increment,
             dt=dt,
-            sensor_pose=sensor_pose
+            sensor_pose=sensor_pose,
+            enable_tracking=enable_tracking
         )
         
-        publish_unconfirmed = self.get_parameter('publish_unconfirmed').value
-        if publish_unconfirmed:
-            tracks_to_publish = active_tracks
-        else:
-            tracks_to_publish = [t for t in active_tracks if t.is_confirmed]
-            
         out_header = Header(stamp=msg.header.stamp, frame_id=out_frame_id)
         
-        # 1. Publish Obstacles
-        obj_array = ObjectArray()
-        obj_array.header = out_header
-        
-        for track in tracks_to_publish:
-            obj = Object()
-            obj.header = out_header
-            obj.id = track.id
-            obj.detection_level = Object.OBJECT_TRACKED if track.is_confirmed else Object.OBJECT_DETECTED
-            obj.object_classified = False
-            
-            # Position (X, Y from state vector, Z=0)
-            obj.pose.position = Point(x=track.x[0], y=track.x[1], z=0.0)
-            
-            # Orientation
-            if track.shape_type == 1: # BOX
-                yaw = track.shape_dims[2]
-                cy = math.cos(yaw * 0.5)
-                sy = math.sin(yaw * 0.5)
-                obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=sy, w=cy)
+        # 1. Publish Obstacles (Tracks)
+        if publish_object_array and enable_tracking:
+            publish_unconfirmed = self.get_parameter('publish_unconfirmed').value
+            if publish_unconfirmed:
+                tracks_to_publish = active_tracks
             else:
-                obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+                tracks_to_publish = [t for t in active_tracks if t.is_confirmed]
                 
-            # Velocity
-            obj.twist.linear = Vector3(x=track.x[2], y=track.x[3], z=0.0)
-            obj.twist.angular = Vector3(x=0.0, y=0.0, z=0.0)
+            obj_array = ObjectArray()
+            obj_array.header = out_header
             
-            # Shape
-            if track.shape_type == 0: # CIRCLE
-                obj.shape.type = SolidPrimitive.CYLINDER
-                obj.shape.dimensions = [0.5, track.shape_dims[0]]
-            elif track.shape_type == 1: # BOX
-                obj.shape.type = SolidPrimitive.BOX
-                obj.shape.dimensions = [track.shape_dims[0], track.shape_dims[1], 0.5]
+            for track in tracks_to_publish:
+                obj = Object()
+                obj.header = out_header
+                obj.id = track.id
+                obj.detection_level = Object.OBJECT_TRACKED if track.is_confirmed else Object.OBJECT_DETECTED
+                obj.object_classified = False
                 
-            # Polygon
-            poly = Polygon()
-            for pt in track.polygon:
-                poly.points.append(Point32(x=float(pt[0]), y=float(pt[1]), z=0.0))
-            obj.polygon = poly
-            
-            obj_array.objects.append(obj)
-            
-        self.obstacles_pub.publish(obj_array)
+                # Position (X, Y from state vector, Z=0)
+                obj.pose.position = Point(x=track.x[0], y=track.x[1], z=0.0)
+                
+                # Orientation
+                if track.shape_type == 1: # BOX
+                    yaw = track.shape_dims[2]
+                    cy = math.cos(yaw * 0.5)
+                    sy = math.sin(yaw * 0.5)
+                    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=sy, w=cy)
+                else:
+                    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+                    
+                # Velocity
+                obj.twist.linear = Vector3(x=track.x[2], y=track.x[3], z=0.0)
+                obj.twist.angular = Vector3(x=0.0, y=0.0, z=0.0)
+                
+                # Shape
+                if track.shape_type == 0: # CIRCLE
+                    obj.shape.type = SolidPrimitive.CYLINDER
+                    obj.shape.dimensions = [0.5, track.shape_dims[0]]
+                elif track.shape_type == 1: # BOX
+                    obj.shape.type = SolidPrimitive.BOX
+                    obj.shape.dimensions = [track.shape_dims[0], track.shape_dims[1], 0.5]
+                    
+                # Polygon
+                poly = Polygon()
+                for pt in track.polygon:
+                    poly.points.append(Point32(x=float(pt[0]), y=float(pt[1]), z=0.0))
+                obj.polygon = poly
+                
+                obj_array.objects.append(obj)
+                
+            self.obstacles_pub.publish(obj_array)
+
+        # 1.5. Publish ObstacleArray (Detections)
+        if publish_obstacle_array:
+            if NAV2_DYNAMIC_MSGS_AVAILABLE:
+                if not hasattr(self, 'detections_pub'):
+                    self.detections_pub = self.create_publisher(ObstacleArray, 'detections', 10)
+                
+                obstacle_array = ObstacleArray()
+                obstacle_array.header = out_header
+                for det in detections:
+                    obstacle = self.pack_nav2_obstacle_msg(det)
+                    obstacle_array.obstacles.append(obstacle)
+                self.detections_pub.publish(obstacle_array)
+            else:
+                if not getattr(self, '_nav2_warned', False):
+                    self.get_logger().warning("nav2_dynamic_msgs not available; nav2 ObstacleArray output disabled")
+                    self._nav2_warned = True
         
         # 2. Publish Debug PointCloud (debug pointcloud stays in the sensor frame)
         if self.publish_pc and len(clusters) > 0:

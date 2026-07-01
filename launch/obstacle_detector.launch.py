@@ -25,9 +25,16 @@ def generate_launch_description():
         description='Path to the parameter configuration YAML file'
     )
 
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Use simulation (bag) clock if true'
+    )
+
     # Launch Configurations
     use_cpp_node = LaunchConfiguration('use_cpp_node')
     params_file = LaunchConfiguration('params_file')
+    use_sim_time = LaunchConfiguration('use_sim_time')
 
     # C++ Obstacle Detector Executable Node
     cpp_node = Node(
@@ -35,7 +42,7 @@ def generate_launch_description():
         executable='laser_obstacle_detector_node_exe',
         name='laser_obstacle_detector',
         output='screen',
-        parameters=[params_file],
+        parameters=[params_file, {'use_sim_time': use_sim_time}],
         condition=IfCondition(use_cpp_node)
     )
 
@@ -45,13 +52,14 @@ def generate_launch_description():
         executable='laser_obstacle_detector.py',
         name='laser_obstacle_detector',
         output='screen',
-        parameters=[params_file],
+        parameters=[params_file, {'use_sim_time': use_sim_time}],
         condition=UnlessCondition(use_cpp_node)
     )
 
     return LaunchDescription([
         use_cpp_arg,
         params_file_arg,
+        use_sim_time_arg,
         cpp_node,
         python_node
     ])

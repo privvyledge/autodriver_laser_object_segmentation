@@ -95,7 +95,7 @@ public:
 
         // Subscriptions
         scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
-            "scan", 10, std::bind(&LaserObstacleDetectorNode::scan_callback, this, std::placeholders::_1)
+            "scan", rclcpp::SensorDataQoS(), std::bind(&LaserObstacleDetectorNode::scan_callback, this, std::placeholders::_1)
         );
 
         // Publishers

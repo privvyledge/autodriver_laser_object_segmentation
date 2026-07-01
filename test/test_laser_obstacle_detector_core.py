@@ -144,7 +144,7 @@ class TestLaserObstacleDetectorCore(unittest.TestCase):
             ranges[i] = 5.0
             
         # Run process
-        confirmed, clusters = self.detector.process(ranges, -math.pi, angle_inc)
+        confirmed, detections, clusters = self.detector.process(ranges, -math.pi, angle_inc)
         
         # Check that we found 2 clusters
         self.assertEqual(len(clusters), 2)
@@ -369,11 +369,11 @@ class TestLaserObstacleDetectorCore(unittest.TestCase):
         try:
             self.detector.preprocess_scan = lambda r, a_min, a_inc: (wall_pts_sensor_frame_1, np.arange(len(wall_pts_sensor_frame_1)))
             self.detector.cluster_points = lambda p, v_idx, a_inc: [p]
-            tracks1, _ = self.detector.process([1.0]*10, 0.0, 0.1, dt=0.1, sensor_pose=(0.0, 0.0, 0.0))
+            tracks1, _, _ = self.detector.process([1.0]*10, 0.0, 0.1, dt=0.1, sensor_pose=(0.0, 0.0, 0.0))
             
             self.detector.preprocess_scan = lambda r, a_min, a_inc: (wall_pts_sensor_frame_2, np.arange(len(wall_pts_sensor_frame_2)))
             self.detector.cluster_points = lambda p, v_idx, a_inc: [p]
-            tracks2, _ = self.detector.process([1.0]*10, 0.0, 0.1, dt=0.1, sensor_pose=(tx, ty, yaw))
+            tracks2, _, _ = self.detector.process([1.0]*10, 0.0, 0.1, dt=0.1, sensor_pose=(tx, ty, yaw))
             
             self.assertEqual(len(tracks2), 1)
             vx, vy = tracks2[0].x[2], tracks2[0].x[3]

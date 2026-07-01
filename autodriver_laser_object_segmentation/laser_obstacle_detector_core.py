@@ -615,11 +615,12 @@ class LaserObstacleDetectorCore:
                 self.next_track_id += 1
                 self.tracks.append(new_track)
 
-    def process(self, ranges, angle_min, angle_increment, dt=None, sensor_pose=None):
+    def process(self, ranges, angle_min, angle_increment, dt=None, sensor_pose=None, enable_tracking=True):
         """
         Main execution pipeline call.
         Returns:
             list of active and confirmed Track objects
+            list of shape-fit detections: (shape_type, centroid, dims, polygon)
             list of raw clusters in Cartesian space (for debug output)
         """
         if dt is None:
@@ -659,16 +660,19 @@ class LaserObstacleDetectorCore:
                 
                 # Transform OBB yaw
                 if shape_type == 1:
-                    box_yaw = (dims[2] + yaw) % math.pi
-                    dims = [dims[0], dims[1], box_yaw]
-                    
+                     box_yaw = (dims[2] + yaw) % math.pi
+                     dims = [dims[0], dims[1], box_yaw]
+                     
             detections.append((shape_type, centroid, dims, polygon))
             
         # 4. Tracking (tracking frame)
-        self.associate_and_track(detections, dt)
-        
-        # Update confirmation state
-        for track in self.tracks:
-            track.is_confirmed = (track.age >= self.min_track_age)
+        if enable_tracking:
+            self.associate_and_track(detections, dt)
+            
+            # Update confirmation state
+            for track in self.tracks:
+                track.is_confirmed = (track.age >= self.min_track_age)
+        else:
+            self.tracks = []
                 
-        return self.tracks, clusters
+        return self.tracks, detections, clusters
