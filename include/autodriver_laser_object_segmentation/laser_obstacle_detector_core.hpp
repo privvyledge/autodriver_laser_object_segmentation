@@ -131,6 +131,7 @@ private:
         double dt
     );
     void update_track_kf(Track& track, const Point2D& detection_centroid, double dt);
+    void smooth_shape(Track& track, uint8_t shape_type, const std::vector<double>& dims);
 };
 
 } // namespace autodriver_laser_object_segmentation

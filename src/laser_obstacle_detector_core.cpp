@@ -869,6 +869,50 @@ void LaserObstacleDetectorCore::update_track_kf(Track& track, const Point2D& det
     track.P = mat_mul_4x4(I_KH, track.P);
 }
 
+void LaserObstacleDetectorCore::smooth_shape(Track& track, uint8_t shape_type, const std::vector<double>& dims)
+{
+    if (shape_smoothing_alpha < 1.0 && track.shape_type == shape_type && track.shape_dims.size() == dims.size())
+    {
+        double alpha = shape_smoothing_alpha;
+        if (shape_type == 0) // CIRCLE
+        {
+            double r_smooth = alpha * dims[0] + (1.0 - alpha) * track.shape_dims[0];
+            track.shape_dims = {r_smooth};
+        }
+        else if (shape_type == 1) // BOX
+        {
+            double l_smooth = alpha * dims[0] + (1.0 - alpha) * track.shape_dims[0];
+            double w_smooth = alpha * dims[1] + (1.0 - alpha) * track.shape_dims[1];
+
+            // Yaw blending with pi-symmetry
+            double y_prev = track.shape_dims[2];
+            double y_curr = dims[2];
+
+            double cos_prev = std::cos(2.0 * y_prev);
+            double sin_prev = std::sin(2.0 * y_prev);
+            double cos_curr = std::cos(2.0 * y_curr);
+            double sin_curr = std::sin(2.0 * y_curr);
+
+            double cos_smooth = alpha * cos_curr + (1.0 - alpha) * cos_prev;
+            double sin_smooth = alpha * sin_curr + (1.0 - alpha) * sin_prev;
+
+            double yaw_smooth = 0.5 * std::atan2(sin_smooth, cos_smooth);
+            yaw_smooth = std::fmod(yaw_smooth, M_PI);
+            if (yaw_smooth < 0.0) yaw_smooth += M_PI;
+
+            track.shape_dims = {l_smooth, w_smooth, yaw_smooth};
+        }
+        else
+        {
+            track.shape_dims = dims;
+        }
+    }
+    else
+    {
+        track.shape_dims = dims;
+    }
+}
+
 std::vector<int> LaserObstacleDetectorCore::solve_hungarian(const std::vector<std::vector<double>>& cost_matrix)
 {
     int R = cost_matrix.size();
@@ -997,47 +1041,7 @@ void LaserObstacleDetectorCore::associate_and_update(
                     const auto& [shape_type, centroid, dims, polygon] = detections[d];
                     update_track_kf(track, centroid, dt_val);
 
-                    // Shape smoothing
-                    if (shape_smoothing_alpha < 1.0 && track.shape_type == shape_type && track.shape_dims.size() == dims.size())
-                    {
-                        double alpha = shape_smoothing_alpha;
-                        if (shape_type == 0) // CIRCLE
-                        {
-                            double r_smooth = alpha * dims[0] + (1.0 - alpha) * track.shape_dims[0];
-                            track.shape_dims = {r_smooth};
-                        }
-                        else if (shape_type == 1) // BOX
-                        {
-                            double l_smooth = alpha * dims[0] + (1.0 - alpha) * track.shape_dims[0];
-                            double w_smooth = alpha * dims[1] + (1.0 - alpha) * track.shape_dims[1];
-
-                            // Yaw blending with pi-symmetry
-                            double y_prev = track.shape_dims[2];
-                            double y_curr = dims[2];
-
-                            double cos_prev = std::cos(2.0 * y_prev);
-                            double sin_prev = std::sin(2.0 * y_prev);
-                            double cos_curr = std::cos(2.0 * y_curr);
-                            double sin_curr = std::sin(2.0 * y_curr);
-
-                            double cos_smooth = alpha * cos_curr + (1.0 - alpha) * cos_prev;
-                            double sin_smooth = alpha * sin_curr + (1.0 - alpha) * sin_prev;
-
-                            double yaw_smooth = 0.5 * std::atan2(sin_smooth, cos_smooth);
-                            yaw_smooth = std::fmod(yaw_smooth, M_PI);
-                            if (yaw_smooth < 0.0) yaw_smooth += M_PI;
-
-                            track.shape_dims = {l_smooth, w_smooth, yaw_smooth};
-                        }
-                        else
-                        {
-                            track.shape_dims = dims;
-                        }
-                    }
-                    else
-                    {
-                        track.shape_dims = dims;
-                    }
+                    smooth_shape(track, shape_type, dims);
 
                     track.shape_type = shape_type;
                     track.polygon = polygon;
@@ -1088,50 +1092,10 @@ void LaserObstacleDetectorCore::associate_and_update(
                     // Update Track
                     auto& track = tracks_[assoc.t_idx];
                     const auto& [shape_type, centroid, dims, polygon] = detections[assoc.d_idx];
-                    
+
                     update_track_kf(track, centroid, dt_val);
 
-                    // Shape smoothing
-                    if (shape_smoothing_alpha < 1.0 && track.shape_type == shape_type && track.shape_dims.size() == dims.size())
-                    {
-                        double alpha = shape_smoothing_alpha;
-                        if (shape_type == 0) // CIRCLE
-                        {
-                            double r_smooth = alpha * dims[0] + (1.0 - alpha) * track.shape_dims[0];
-                            track.shape_dims = {r_smooth};
-                        }
-                        else if (shape_type == 1) // BOX
-                        {
-                            double l_smooth = alpha * dims[0] + (1.0 - alpha) * track.shape_dims[0];
-                            double w_smooth = alpha * dims[1] + (1.0 - alpha) * track.shape_dims[1];
-
-                            // Yaw blending with pi-symmetry
-                            double y_prev = track.shape_dims[2];
-                            double y_curr = dims[2];
-
-                            double cos_prev = std::cos(2.0 * y_prev);
-                            double sin_prev = std::sin(2.0 * y_prev);
-                            double cos_curr = std::cos(2.0 * y_curr);
-                            double sin_curr = std::sin(2.0 * y_curr);
-
-                            double cos_smooth = alpha * cos_curr + (1.0 - alpha) * cos_prev;
-                            double sin_smooth = alpha * sin_curr + (1.0 - alpha) * sin_prev;
-
-                            double yaw_smooth = 0.5 * std::atan2(sin_smooth, cos_smooth);
-                            yaw_smooth = std::fmod(yaw_smooth, M_PI);
-                            if (yaw_smooth < 0.0) yaw_smooth += M_PI;
-
-                            track.shape_dims = {l_smooth, w_smooth, yaw_smooth};
-                        }
-                        else
-                        {
-                            track.shape_dims = dims;
-                        }
-                    }
-                    else
-                    {
-                        track.shape_dims = dims;
-                    }
+                    smooth_shape(track, shape_type, dims);
 
                     track.shape_type = shape_type;
                     track.polygon = polygon;
