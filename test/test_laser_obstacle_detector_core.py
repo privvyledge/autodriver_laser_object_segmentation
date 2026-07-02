@@ -447,5 +447,29 @@ class TestLaserObstacleDetectorCore(unittest.TestCase):
         self.detector.process([3.0]*10, 0.0, 0.1, dt=0.1)
         self.assertTrue(self.detector.tracks[0].is_confirmed)
 
+    def test_shape_type_hysteresis(self):
+        from autodriver_laser_object_segmentation.laser_obstacle_detector_core import Track
+        # hysteresis=3: a differing type must persist 3 consecutive frames to switch.
+        tr = Track(1, [0.0, 0.0], 0, [0.5], [], dt=0.1,
+                   shape_smoothing_alpha=1.0, kf_process_noise=0.1, shape_type_hysteresis=3)
+        # Two transient BOX frames must NOT flip the type away from CIRCLE.
+        tr.update([0.0, 0.0], 1, [0.4, 0.3, 0.0], [])
+        self.assertEqual(tr.shape_type, 0)
+        tr.update([0.0, 0.0], 1, [0.4, 0.3, 0.0], [])
+        self.assertEqual(tr.shape_type, 0)
+        # Third consecutive BOX frame confirms the switch.
+        tr.update([0.0, 0.0], 1, [0.4, 0.3, 0.0], [])
+        self.assertEqual(tr.shape_type, 1)
+        # A single stray CIRCLE frame is rejected (counter resets, stays BOX).
+        tr.update([0.0, 0.0], 0, [0.5], [])
+        self.assertEqual(tr.shape_type, 1)
+
+    def test_hysteresis_disabled_by_default(self):
+        from autodriver_laser_object_segmentation.laser_obstacle_detector_core import Track
+        # Default hysteresis=1 => switch immediately (preserves legacy behavior).
+        tr = Track(1, [0.0, 0.0], 0, [0.5], [], dt=0.1)
+        tr.update([0.0, 0.0], 1, [0.4, 0.3, 0.0], [])
+        self.assertEqual(tr.shape_type, 1)
+
 if __name__ == '__main__':
     unittest.main()

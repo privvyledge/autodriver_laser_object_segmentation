@@ -64,7 +64,9 @@ LaserObstacleDetectorCore::LaserObstacleDetectorCore(
     double max_circle_radius,
     double corner_angle_min_deg,
     double corner_angle_max_deg,
-    double shape_smoothing_alpha
+    double shape_smoothing_alpha,
+    double kf_process_noise,
+    uint32_t shape_type_hysteresis
 ) : min_range(min_range),
     max_range(max_range),
     beta(beta_incidence_rad),
@@ -86,16 +88,19 @@ LaserObstacleDetectorCore::LaserObstacleDetectorCore(
     corner_angle_min_deg(corner_angle_min_deg),
     corner_angle_max_deg(corner_angle_max_deg),
     shape_smoothing_alpha(shape_smoothing_alpha),
+    kf_process_noise(kf_process_noise),
+    shape_type_hysteresis(shape_type_hysteresis),
     next_track_id_(1)
 {
 }
 
-std::pair<std::vector<Track>, std::vector<std::vector<Point2D>>> LaserObstacleDetectorCore::process(
+std::tuple<std::vector<Track>, std::vector<Detection>, std::vector<std::vector<Point2D>>> LaserObstacleDetectorCore::process(
     const std::vector<float>& ranges,
     double angle_min,
     double angle_increment,
     double dt_val,
-    const std::vector<double>& sensor_pose
+    const std::vector<double>& sensor_pose,
+    bool enable_tracking
 )
 {
     // Update dt
@@ -108,7 +113,7 @@ std::pair<std::vector<Track>, std::vector<std::vector<Point2D>>> LaserObstacleDe
     auto clusters = cluster_points(points, valid_indices, angle_increment);
 
     // 3. Shape Fitting (sensor frame)
-    std::vector<std::tuple<uint8_t, Point2D, std::vector<double>, std::vector<Point2D>>> detections;
+    std::vector<Detection> detections;
     for (const auto& cluster : clusters)
     {
         uint8_t shape_type;
@@ -151,15 +156,22 @@ std::pair<std::vector<Track>, std::vector<std::vector<Point2D>>> LaserObstacleDe
     }
 
     // 5. Tracking (tracking frame)
-    associate_and_update(detections, dt_val);
-
-    // Update confirmation state and return all active tracks
-    for (auto& track : tracks_)
+    if (enable_tracking)
     {
-        track.is_confirmed = (track.age >= min_track_age);
+        associate_and_update(detections, dt_val);
+
+        // Update confirmation state and return all active tracks
+        for (auto& track : tracks_)
+        {
+            track.is_confirmed = (track.age >= min_track_age);
+        }
+    }
+    else
+    {
+        tracks_.clear();
     }
 
-    return {tracks_, clusters};
+    return {tracks_, detections, clusters};
 }
 
 std::pair<std::vector<Point2D>, std::vector<size_t>> LaserObstacleDetectorCore::preprocess_scan(
@@ -785,7 +797,7 @@ void LaserObstacleDetectorCore::predict_tracks(double dt_val)
         track.x[1] += dt_val * track.x[3];
 
         // Process noise parameter q
-        double q_val = 0.5;
+        double q_val = kf_process_noise;
 
         // Predict covariance: P = F * P * F^T + Q
         std::array<double, 16> F = {
@@ -913,6 +925,47 @@ void LaserObstacleDetectorCore::smooth_shape(Track& track, uint8_t shape_type, c
     }
 }
 
+void LaserObstacleDetectorCore::update_track_shape(
+    Track& track, uint8_t shape_type,
+    const std::vector<double>& dims, const std::vector<Point2D>& polygon)
+{
+    // Shape-type hysteresis: resist transient per-frame type flips. The KF position
+    // is updated separately (update_track_kf); this only gates the *shape*.
+    if (shape_type_hysteresis > 1 && shape_type != track.shape_type)
+    {
+        if (static_cast<int>(shape_type) == track.pending_type)
+        {
+            track.pending_count += 1;
+        }
+        else
+        {
+            track.pending_type = static_cast<int>(shape_type);
+            track.pending_count = 1;
+        }
+        if (track.pending_count < shape_type_hysteresis)
+        {
+            // Reject the flip: keep current shape_type / dims / polygon.
+            track.age += 1;
+            track.missed_frames = 0;
+            return;
+        }
+        // Confirmed switch: adopt the new shape below.
+        track.pending_type = -1;
+        track.pending_count = 0;
+    }
+    else
+    {
+        track.pending_type = -1;
+        track.pending_count = 0;
+    }
+
+    smooth_shape(track, shape_type, dims);
+    track.shape_type = shape_type;
+    track.polygon = polygon;
+    track.age += 1;
+    track.missed_frames = 0;
+}
+
 std::vector<int> LaserObstacleDetectorCore::solve_hungarian(const std::vector<std::vector<double>>& cost_matrix)
 {
     int R = cost_matrix.size();
@@ -986,7 +1039,7 @@ std::vector<int> LaserObstacleDetectorCore::solve_hungarian(const std::vector<st
 }
 
 void LaserObstacleDetectorCore::associate_and_update(
-    const std::vector<std::tuple<uint8_t, Point2D, std::vector<double>, std::vector<Point2D>>>& detections,
+    const std::vector<Detection>& detections,
     double dt_val
 )
 {
@@ -1040,13 +1093,7 @@ void LaserObstacleDetectorCore::associate_and_update(
                     auto& track = tracks_[t];
                     const auto& [shape_type, centroid, dims, polygon] = detections[d];
                     update_track_kf(track, centroid, dt_val);
-
-                    smooth_shape(track, shape_type, dims);
-
-                    track.shape_type = shape_type;
-                    track.polygon = polygon;
-                    track.age += 1;
-                    track.missed_frames = 0;
+                    update_track_shape(track, shape_type, dims, polygon);
                 }
             }
         }
@@ -1094,13 +1141,7 @@ void LaserObstacleDetectorCore::associate_and_update(
                     const auto& [shape_type, centroid, dims, polygon] = detections[assoc.d_idx];
 
                     update_track_kf(track, centroid, dt_val);
-
-                    smooth_shape(track, shape_type, dims);
-
-                    track.shape_type = shape_type;
-                    track.polygon = polygon;
-                    track.age += 1;
-                    track.missed_frames = 0;
+                    update_track_shape(track, shape_type, dims, polygon);
                 }
             }
         }

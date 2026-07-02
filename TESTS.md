@@ -173,4 +173,38 @@ In RViz2: set **Fixed Frame** to the `tracking_frame` (e.g. `gosling1/odom`), th
       active.
 - [ ] Object `detection_level` is `0` (`OBJECT_DETECTED`) for new tracks and `1`
       (`OBJECT_TRACKED`) after `min_track_age` (default 3) frames.
+
+---
+
+## 9. Replay a recorded rosbag (F1TENTH test bags)
+
+`scripts/run_bag_test.sh` launches the C++ node + RViz2 with `use_sim_time:=true`, waits for
+initialization, then plays a bag with the standard F1TENTH topic/TF remaps (`/gosling1/...` →
+`scan`, `/tf`, `/tf_static`, `/odom`). It auto-detects localization: bags whose path contains
+`no_localization` get a static `odom → base_link` transform and the VESC odometry remapped to
+`/odom`.
+
+```bash
+cd ~/ros2_ws
+colcon build --symlink-install \
+  --cmake-args ' -DCMAKE_BUILD_TYPE=Release' -DPython3_FIND_VIRTUALENV="ONLY" \
+  --packages-select autodriver_laser_object_segmentation
+source install/setup.bash
+
+# Stationary bag, with localization + pointcloud
+./src/autodriver_laser_object_segmentation/scripts/run_bag_test.sh \
+  /mnt/d/Coding/Projects/f1tenth/test_bags_05252026/stationary_with_localization_and_pointcloud
+
+# Stationary bag, no localization (static odom->base_link is auto-published)
+./src/autodriver_laser_object_segmentation/scripts/run_bag_test.sh \
+  /mnt/d/Coding/Projects/f1tenth/test_bags_05252026/stationary_no_localization
+```
+
+Stationary bags are the best tuning fixture: with the sensor still, any obstacle velocity, marker
+jitter, or shape flip is a detector/tracker artifact rather than ego-motion. To capture a log for
+offline tuning while a bag plays:
+
+```bash
+ros2 bag record -o /tmp/laser_debug /scan /obstacles /debug_markers /tf /tf_static
+```
 </content>

@@ -6,32 +6,39 @@ import scipy.optimize
 
 
 class Track:
-    def __init__(self, track_id, position, shape_type, shape_dims, polygon, dt, shape_smoothing_alpha=1.0):
+    def __init__(self, track_id, position, shape_type, shape_dims, polygon, dt,
+                 shape_smoothing_alpha=1.0, kf_process_noise=0.5, shape_type_hysteresis=1):
         """
         Keeps track of an individual obstacle using a constant-velocity Kalman Filter.
         State vector x = [px, py, vx, vy]^T
         """
         self.id = track_id
         self.dt = dt
-        
+
         # State vector: [px, py, vx, vy]
         self.x = np.array([position[0], position[1], 0.0, 0.0])
-        
+
         # State covariance
         self.P = np.diag([0.1, 0.1, 1.0, 1.0])
-        
-        # Process noise parameter
-        self.q_proc = 0.5
-        
+
+        # Process noise parameter (lower = smoother, trusts the motion model more;
+        # high values let position noise leak into phantom velocity for static objects)
+        self.q_proc = kf_process_noise
+
         # Measurement noise covariance
         self.R = np.diag([0.02, 0.02])
-        
+
         # Track properties
         self.shape_type = shape_type     # 0: CIRCLE, 1: BOX, 2: LINE, 3: CORNER
         self.shape_dims = shape_dims     # list: [radius] or [length, width, height]
         self.polygon = polygon           # List of [x, y] coordinates representing shape boundary
-        
+
         self.shape_smoothing_alpha = shape_smoothing_alpha
+        # Shape-type hysteresis: a matched detection must report a differing shape type
+        # for this many consecutive frames before the track switches type. 1 disables it.
+        self.shape_type_hysteresis = shape_type_hysteresis
+        self._pending_type = None
+        self._pending_count = 0
         self.age = 1
         self.missed_frames = 0
         self.is_confirmed = False
@@ -88,7 +95,27 @@ class Track:
         # Update covariance
         I = np.eye(4)
         self.P = np.dot(I - np.dot(K, H), self.P)
-        
+
+        # Shape-type hysteresis: resist transient per-frame type flips. The KF
+        # position is always updated above; here we only gate the *shape*.
+        if self.shape_type_hysteresis > 1 and shape_type != self.shape_type:
+            if shape_type == self._pending_type:
+                self._pending_count += 1
+            else:
+                self._pending_type = shape_type
+                self._pending_count = 1
+            if self._pending_count < self.shape_type_hysteresis:
+                # Reject the flip: keep current shape_type / dims / polygon.
+                self.age += 1
+                self.missed_frames = 0
+                return
+            # Confirmed switch: adopt the new shape below.
+            self._pending_type = None
+            self._pending_count = 0
+        else:
+            self._pending_type = None
+            self._pending_count = 0
+
         # Smooth shape properties
         if self.shape_smoothing_alpha < 1.0 and self.shape_type == shape_type and len(self.shape_dims) == len(shape_dims):
             alpha = self.shape_smoothing_alpha
@@ -149,7 +176,9 @@ class LaserObstacleDetectorCore:
                  max_circle_radius=1.0,
                  corner_angle_min_deg=65.0,
                  corner_angle_max_deg=115.0,
-                 shape_smoothing_alpha=0.5):
+                 shape_smoothing_alpha=0.5,
+                 kf_process_noise=0.5,
+                 shape_type_hysteresis=1):
         """
         Core LaserScan object detector and tracker library. ROS-independent.
         """
@@ -174,7 +203,9 @@ class LaserObstacleDetectorCore:
         self.corner_angle_min_deg = corner_angle_min_deg
         self.corner_angle_max_deg = corner_angle_max_deg
         self.shape_smoothing_alpha = shape_smoothing_alpha
-        
+        self.kf_process_noise = kf_process_noise
+        self.shape_type_hysteresis = shape_type_hysteresis
+
         self.tracks = []
         self.next_track_id = 1
 
@@ -538,8 +569,13 @@ class LaserObstacleDetectorCore:
         if dt is None:
             dt = self.dt
             
-        # Predict all existing tracks
+        # Predict all existing tracks. Propagate the current (possibly live-reconfigured)
+        # tracker gains onto every existing track so parameter changes take effect
+        # immediately on ALL tracks, not just newly created ones. This mirrors the C++
+        # core, which reads these members live in predict_tracks / update_track_shape.
         for track in self.tracks:
+            track.q_proc = self.kf_process_noise
+            track.shape_type_hysteresis = self.shape_type_hysteresis
             track.predict(dt)
             
         if len(detected_obstacles) == 0:
@@ -610,7 +646,9 @@ class LaserObstacleDetectorCore:
                     dims,
                     polygon,
                     dt,
-                    self.shape_smoothing_alpha
+                    self.shape_smoothing_alpha,
+                    self.kf_process_noise,
+                    self.shape_type_hysteresis
                 )
                 self.next_track_id += 1
                 self.tracks.append(new_track)

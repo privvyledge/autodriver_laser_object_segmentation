@@ -28,12 +28,16 @@
     
     # Multi-Target Tracking
     tracking_frame: "odom"           # Frame for KF tracking + output (poses & velocities)
+    tf_fallback_to_latest: true      # If the exact-stamp TF lookup fails (laggy/gappy localization), reuse the latest-available transform instead of dropping straight to the sensor frame. Lets RViz (Fixed Frame = tracking_frame) still render.
+    tf_latest_max_delay: 2.0         # Max staleness (s) accepted for the latest-available TF fallback. Beyond this, fall back to the sensor frame. SAFETY: a stale ego pose on a fast-moving robot re-introduces small position error; keep low (or 0 to force exact-only) for high-speed use, raise for stationary/slow debugging of deficient bags.
     association_method: "hungarian"  # hungarian (recommended) or greedy
     publish_unconfirmed: true        # Publish tentative tracks as OBJECT_DETECTED
     max_association_distance: 0.8    # Gate distance (in meters) for tracking data association
     min_track_age: 3                 # Required consecutive observed frames before publishing track
     max_missed_frames: 5             # Number of missed updates before a track is deleted
     shape_smoothing_alpha: 0.5       # EMA smoothing coefficient on shape dimensions (1.0 = off)
+    kf_process_noise: 0.1            # KF process noise (q). Lower = smoother, less phantom velocity on static objects; raise if fast dynamic obstacles lag. (was 0.5)
+    shape_type_hysteresis: 3         # A track must see a differing shape type this many consecutive frames before switching (1 = off). Suppresses circle<->box<->line flicker; raise to 5 for near-zero flips.
     
     # Visualization & Debug
     publish_debug_pointcloud: true   # Publish unique color-coded cluster PointCloud2

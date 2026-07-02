@@ -68,6 +68,8 @@ Configurable parameters are declared in [config/params.yaml](config/params.yaml)
 | **`max_missed_frames`** | `int` | `5` | Allowable consecutive missed updates before deleting a track. |
 | **`publish_unconfirmed`** | `bool` | `true` | Also publish tentative (unconfirmed) tracks as `OBJECT_DETECTED`. |
 | **`shape_smoothing_alpha`** | `double` | `0.5` | EMA coefficient on shape dimensions (`1.0` = no smoothing). |
+| **`kf_process_noise`** | `double` | `0.1` | Kalman process noise `q`. Lower = smoother tracks and less phantom velocity on static objects; raise if fast dynamic obstacles lag. |
+| **`shape_type_hysteresis`** | `int` | `3` | A track must observe a differing shape type this many consecutive frames before switching (`1` = off). Suppresses circle↔box↔line flicker; use `5` for near-zero flips. |
 | **`publish_debug_pointcloud`** | `bool` | `true` | Flag to publish colorized point cloud clusters on `debug_clusters`. |
 | **`publish_debug_markers`** | `bool` | `true` | Flag to publish RViz visualization markers on `debug_markers`. |
 
@@ -118,5 +120,13 @@ Run the perception system using the provided launch file [launch/obstacle_detect
   ```bash
   ros2 launch autodriver_laser_object_segmentation obstacle_detector.launch.py params_file:=/path/to/custom_params.yaml
   ```
+
+### Replay a recorded rosbag
+For F1TENTH test bags, [scripts/run_bag_test.sh](scripts/run_bag_test.sh) launches the C++ node + RViz2 with simulated time and the standard `/gosling1/...` → `scan` / `/tf` / `/odom` remaps, then plays the bag. It auto-detects `no_localization` bags and publishes a static `odom → base_link` transform for them:
+```bash
+./src/autodriver_laser_object_segmentation/scripts/run_bag_test.sh \
+  /mnt/d/Coding/Projects/f1tenth/test_bags_05252026/stationary_with_localization_and_pointcloud
+```
+Stationary bags isolate detector/tracker behavior from ego-motion. See [TESTS.md](TESTS.md) §9 for details.
 
 For cloning, dependency install, unit tests, and running against namespaced topics (with TF remaps for ego-motion-aware tracking), see [TESTS.md](TESTS.md).
