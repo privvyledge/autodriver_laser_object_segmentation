@@ -102,6 +102,7 @@ public:
     // Helper functions exposed for C-linkage testing
     static std::vector<Point2D> convex_hull_jarvis(const std::vector<Point2D>& points);
     static void fit_obb(const std::vector<Point2D>& points, Point2D& center, double& length, double& width, double& yaw);
+    static void fit_circle_kasa(const std::vector<Point2D>& points, Point2D& center, double& radius);
     std::vector<int> solve_hungarian(const std::vector<std::vector<double>>& cost_matrix);
 
 private:
@@ -130,7 +131,6 @@ private:
     );
 
     // Geometry & Shape fitting
-    static void fit_circle_kasa(const std::vector<Point2D>& points, Point2D& center, double& radius);
     static double distance_to_line(const Point2D& p, const Point2D& p1, const Point2D& p2);
     std::vector<std::vector<Point2D>> split_and_merge(const std::vector<Point2D>& points);
 
@@ -153,6 +153,7 @@ private:
 extern "C" {
     void test_convex_hull(const double* points_x, const double* points_y, int n, double* hull_x, double* hull_y, int* hull_n);
     void test_obb(const double* points_x, const double* points_y, int n, double* cx, double* cy, double* length, double* width, double* yaw);
+    void test_circle_kasa(const double* points_x, const double* points_y, int n, double* cx, double* cy, double* radius);
     void test_hungarian(const double* cost_matrix, int rows, int cols, int* row_ind, int* col_ind, int* count);
 }
 

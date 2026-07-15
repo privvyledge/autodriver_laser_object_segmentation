@@ -420,9 +420,9 @@ void LaserObstacleDetectorCore::fit_circle_kasa(const std::vector<Point2D>& poin
                   ATz[0] * (ATA[1][0]*ATA[2][2] - ATA[1][2]*ATA[2][0]) +
                   ATA[0][2] * (ATA[1][0]*ATz[2] - ATz[1]*ATA[2][0]);
 
-    double det2 = ATA[0][0] * (ATA[1][1]*ATz[2] - ATA[1][2]*ATz[1]) -
-                  ATA[0][1] * (ATA[1][0]*ATz[2] - ATA[1][2]*ATz[0]) +
-                  ATz[0] * (ATA[1][0]*ATz[1] - ATA[1][1]*ATA[2][0]);
+    double det2 = ATA[0][0] * (ATA[1][1]*ATz[2] - ATz[1]*ATA[2][1]) -
+                  ATA[0][1] * (ATA[1][0]*ATz[2] - ATz[1]*ATA[2][0]) +
+                  ATz[0] * (ATA[1][0]*ATA[2][1] - ATA[1][1]*ATA[2][0]);
 
     double uc = det0 / det;
     double vc = det1 / det;
@@ -1223,6 +1223,20 @@ void test_obb(const double* points_x, const double* points_y, int n, double* cx,
     *length = l;
     *width = w;
     *yaw = y;
+}
+
+void test_circle_kasa(const double* points_x, const double* points_y, int n, double* cx, double* cy, double* radius)
+{
+    std::vector<autodriver_laser_object_segmentation::Point2D> pts(n);
+    for (int i = 0; i < n; ++i) {
+        pts[i] = {points_x[i], points_y[i]};
+    }
+    autodriver_laser_object_segmentation::Point2D center;
+    double r = 0.0;
+    autodriver_laser_object_segmentation::LaserObstacleDetectorCore::fit_circle_kasa(pts, center, r);
+    *cx = center.x;
+    *cy = center.y;
+    *radius = r;
 }
 
 void test_hungarian(const double* cost_matrix, int rows, int cols, int* row_ind, int* col_ind, int* count)

@@ -39,6 +39,10 @@ def _ir(lo, hi, step=1, desc=''):
 
 
 class LaserObstacleDetectorNode(Node):
+    # Nominal thickness (m) given to LINE/CORNER shape primitives, which have no fitted
+    # width. Sized around the sensor's range noise; `polygon` remains authoritative.
+    LINE_THICKNESS = 0.05
+
     def __init__(self):
         super().__init__('laser_obstacle_detector')
         
@@ -344,26 +348,43 @@ class LaserObstacleDetectorNode(Node):
                 obj.pose.position = Point(x=track.x[0], y=track.x[1], z=0.0)
                 
                 # Orientation
+                yaw = 0.0
                 if track.shape_type == 1: # BOX
                     yaw = track.shape_dims[2]
-                    cy = math.cos(yaw * 0.5)
-                    sy = math.sin(yaw * 0.5)
-                    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=sy, w=cy)
-                else:
-                    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-                    
+                elif track.shape_type == 2 and len(track.polygon) >= 2: # LINE: along the segment
+                    p_start, p_end = track.polygon[0], track.polygon[-1]
+                    yaw = math.atan2(p_end[1] - p_start[1], p_end[0] - p_start[0])
+                obj.pose.orientation = Quaternion(
+                    x=0.0, y=0.0, z=math.sin(yaw * 0.5), w=math.cos(yaw * 0.5))
+
                 # Velocity
                 obj.twist.linear = Vector3(x=track.x[2], y=track.x[3], z=0.0)
                 obj.twist.angular = Vector3(x=0.0, y=0.0, z=0.0)
-                
-                # Shape
+
+                # Shape. LINE/CORNER carry no fitted dims -- their geometry lives in
+                # `polygon`, which is authoritative. Derive a coarse bound centred on the
+                # published pose so consumers get a well-formed primitive rather than a
+                # default-constructed one.
                 if track.shape_type == 0: # CIRCLE
                     obj.shape.type = SolidPrimitive.CYLINDER
                     obj.shape.dimensions = [0.5, track.shape_dims[0]]
                 elif track.shape_type == 1: # BOX
                     obj.shape.type = SolidPrimitive.BOX
                     obj.shape.dimensions = [track.shape_dims[0], track.shape_dims[1], 0.5]
-                    
+                elif track.shape_type == 2 and len(track.polygon) >= 2: # LINE -> thin BOX
+                    p_start, p_end = track.polygon[0], track.polygon[-1]
+                    length = math.hypot(p_end[0] - p_start[0], p_end[1] - p_start[1])
+                    obj.shape.type = SolidPrimitive.BOX
+                    obj.shape.dimensions = [length, self.LINE_THICKNESS, 0.5]
+                elif track.shape_type == 3 and len(track.polygon) >= 1: # CORNER -> enclosing BOX
+                    # pose is the corner vertex, not a box centre, so size the box to
+                    # enclose every vertex symmetrically about it.
+                    half_x = max(abs(p[0] - track.x[0]) for p in track.polygon)
+                    half_y = max(abs(p[1] - track.x[1]) for p in track.polygon)
+                    obj.shape.type = SolidPrimitive.BOX
+                    obj.shape.dimensions = [max(2.0 * half_x, self.LINE_THICKNESS),
+                                            max(2.0 * half_y, self.LINE_THICKNESS), 0.5]
+
                 # Polygon
                 poly = Polygon()
                 for pt in track.polygon:

@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <algorithm>
 
 #include "autodriver_laser_object_segmentation/laser_obstacle_detector_core.hpp"
 
@@ -35,6 +36,10 @@ namespace autodriver_laser_object_segmentation
 class LaserObstacleDetectorNode : public rclcpp::Node
 {
 public:
+    // Nominal thickness (m) given to LINE/CORNER shape primitives, which have no fitted
+    // width. Sized around the sensor's range noise; `polygon` remains authoritative.
+    static constexpr double LINE_THICKNESS = 0.05;
+
     explicit LaserObstacleDetectorNode(const rclcpp::NodeOptions& options)
         : Node("laser_obstacle_detector", options)
     {
@@ -353,21 +358,21 @@ private:
                 obj.pose.position.z = 0.0;
 
                 // Orientation
+                double yaw = 0.0;
                 if (track.shape_type == 1) // BOX
                 {
-                    double yaw = track.shape_dims[2];
-                    obj.pose.orientation.x = 0.0;
-                    obj.pose.orientation.y = 0.0;
-                    obj.pose.orientation.z = std::sin(yaw * 0.5);
-                    obj.pose.orientation.w = std::cos(yaw * 0.5);
+                    yaw = track.shape_dims[2];
                 }
-                else
+                else if (track.shape_type == 2 && track.polygon.size() >= 2) // LINE: along the segment
                 {
-                    obj.pose.orientation.x = 0.0;
-                    obj.pose.orientation.y = 0.0;
-                    obj.pose.orientation.z = 0.0;
-                    obj.pose.orientation.w = 1.0;
+                    const auto& p_start = track.polygon.front();
+                    const auto& p_end = track.polygon.back();
+                    yaw = std::atan2(p_end.y - p_start.y, p_end.x - p_start.x);
                 }
+                obj.pose.orientation.x = 0.0;
+                obj.pose.orientation.y = 0.0;
+                obj.pose.orientation.z = std::sin(yaw * 0.5);
+                obj.pose.orientation.w = std::cos(yaw * 0.5);
 
                 // Velocity
                 obj.twist.linear.x = track.x[2];
@@ -377,7 +382,10 @@ private:
                 obj.twist.angular.y = 0.0;
                 obj.twist.angular.z = 0.0;
 
-                // Shape representation
+                // Shape representation. LINE/CORNER carry no fitted dims -- their geometry
+                // lives in `polygon`, which is authoritative. Derive a coarse bound centred
+                // on the published pose so consumers get a well-formed primitive rather than
+                // a default-constructed one.
                 if (track.shape_type == 0) // CIRCLE
                 {
                     obj.shape.type = shape_msgs::msg::SolidPrimitive::CYLINDER;
@@ -387,6 +395,28 @@ private:
                 {
                     obj.shape.type = shape_msgs::msg::SolidPrimitive::BOX;
                     obj.shape.dimensions = {track.shape_dims[0], track.shape_dims[1], 0.5}; // [x, y, z]
+                }
+                else if (track.shape_type == 2 && track.polygon.size() >= 2) // LINE -> thin BOX
+                {
+                    const auto& p_start = track.polygon.front();
+                    const auto& p_end = track.polygon.back();
+                    double length = std::hypot(p_end.x - p_start.x, p_end.y - p_start.y);
+                    obj.shape.type = shape_msgs::msg::SolidPrimitive::BOX;
+                    obj.shape.dimensions = {length, LINE_THICKNESS, 0.5};
+                }
+                else if (track.shape_type == 3 && !track.polygon.empty()) // CORNER -> enclosing BOX
+                {
+                    // pose is the corner vertex, not a box centre, so size the box to
+                    // enclose every vertex symmetrically about it.
+                    double half_x = 0.0, half_y = 0.0;
+                    for (const auto& p : track.polygon)
+                    {
+                        half_x = std::max(half_x, std::abs(p.x - track.x[0]));
+                        half_y = std::max(half_y, std::abs(p.y - track.x[1]));
+                    }
+                    obj.shape.type = shape_msgs::msg::SolidPrimitive::BOX;
+                    obj.shape.dimensions = {std::max(2.0 * half_x, LINE_THICKNESS),
+                                            std::max(2.0 * half_y, LINE_THICKNESS), 0.5};
                 }
 
                 // Polygon boundary
