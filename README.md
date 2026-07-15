@@ -11,7 +11,7 @@ It contains a dual-language implementation with mirror algorithms in both C++ an
 ## Architecture & Algorithm Pipeline
 
 1. **Preprocessing:** Optionally applies a 1D median filter (window size = 3, toggled by `use_median_filter`) to suppress salt-and-pepper noise, filters points outside sensor/user ranges (`min_range` to `max_range`), and projects valid beams to 2D Cartesian coordinates. All preprocessing, clustering, and shape fitting happen in the **sensor frame**.
-2. **Clustering:** Performs range-adaptive **Sequential Jump Distance Clustering (JDC)** based on the Dietmayer formula to segment adjacent points into clusters, handling wrap-around for 360° scans (vectorized).
+2. **Clustering:** Performs range-adaptive **Sequential Jump Distance Clustering (JDC)** based on the Dietmayer formula [1] to segment adjacent points into clusters, handling wrap-around for 360° scans (vectorized).
 3. **Shape Fitting:** Fits multiple geometric models to clusters:
    - **Circle:** Least-squares circle fitting (Kasa method).
    - **Oriented Bounding Box (OBB):** Minimum-area box via **rotating calipers** on the convex hull (exact, no angular quantization).
@@ -130,3 +130,9 @@ For F1TENTH test bags, [scripts/run_bag_test.sh](scripts/run_bag_test.sh) launch
 Stationary bags isolate detector/tracker behavior from ego-motion. See [TESTS.md](TESTS.md) §9 for details.
 
 For cloning, dependency install, unit tests, and running against namespaced topics (with TF remaps for ego-motion-aware tracking), see [TESTS.md](TESTS.md).
+
+---
+
+## References
+
+* **[1]** Dietmayer, K. C., Sparr, M., & Fürstenberg, K. C. (2001). "Road users classification by obstacles detection and tracking". In *Proceedings of the IEEE Intelligent Vehicles Symposium (IV)* (pp. 53-58).
