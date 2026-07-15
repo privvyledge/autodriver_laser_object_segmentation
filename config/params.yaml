@@ -8,10 +8,10 @@
     max_range: 8.0                   # Max tracking range (X4 physically supports up to 10m)
     
     # Clustering (Dietmayer sequential JDC)
-    beta_incidence_deg: 12.0         # Angle of incidence threshold (typically 10-15 deg)
-    sigma_r: 0.02                    # Standard deviation of scan range measurements (approx 2cm for X4)
-    min_jump_distance: 0.15          # Minimum clustering distance (in meters) between separate objects
-    max_jump_distance: 1.0           # Maximum clustering distance threshold
+    beta_incidence_deg: 10.0         # Angle of incidence threshold (typically 10-15 deg). Lower widens the adaptive jump threshold -> fewer spurious splits. 10 measurably beats 12 on recorded data (cluster churn -26%, centroid jump p95 -22%, shape flips -> 0); below 8 gains nothing and risks merging adjacent objects.
+    sigma_r: 0.02                    # Standard deviation of scan range measurements (approx 2cm for X4). Only shifts the threshold by 3*sigma_r (6cm), which is swamped by the range-proportional beam term beyond ~1m -- keep at the honest sensor figure and tune beta instead.
+    min_jump_distance: 0.15          # Lower clamp on the adaptive jump threshold. NOTE: inert on X4 data -- the clamp binds ~13% of beam pairs, but jump distances there are bimodal (<5cm on a surface, >50cm at a real boundary), so no break decision changes anywhere in 0.05-0.30.
+    max_jump_distance: 1.0           # Upper clamp on the adaptive jump threshold. Also inert on X4 data (0.5/1.0/2.0 give identical clusters) for the same bimodal reason.
     min_cluster_points: 4            # Ignore clusters with fewer than 4 points (noise filter)
     max_cluster_points: 2000         # Limit maximum cluster point count (raised to survive walls)
     
@@ -28,12 +28,16 @@
     
     # Multi-Target Tracking
     tracking_frame: "odom"           # Frame for KF tracking + output (poses & velocities)
+    tf_fallback_to_latest: true      # If the exact-stamp TF lookup fails (laggy/gappy localization), reuse the latest-available transform instead of dropping straight to the sensor frame. Lets RViz (Fixed Frame = tracking_frame) still render.
+    tf_latest_max_delay: 2.0         # Max staleness (s) accepted for the latest-available TF fallback. Beyond this, fall back to the sensor frame. SAFETY: a stale ego pose on a fast-moving robot re-introduces small position error; keep low (or 0 to force exact-only) for high-speed use, raise for stationary/slow debugging of deficient bags.
     association_method: "hungarian"  # hungarian (recommended) or greedy
     publish_unconfirmed: true        # Publish tentative tracks as OBJECT_DETECTED
     max_association_distance: 0.8    # Gate distance (in meters) for tracking data association
     min_track_age: 3                 # Required consecutive observed frames before publishing track
     max_missed_frames: 5             # Number of missed updates before a track is deleted
     shape_smoothing_alpha: 0.5       # EMA smoothing coefficient on shape dimensions (1.0 = off)
+    kf_process_noise: 0.1            # KF process noise (q). Lower = smoother, less phantom velocity on static objects; raise if fast dynamic obstacles lag. (was 0.5)
+    shape_type_hysteresis: 3         # A track must see a differing shape type this many consecutive frames before switching (1 = off). Suppresses circle<->box<->line flicker; raise to 5 for near-zero flips.
     
     # Visualization & Debug
     publish_debug_pointcloud: true   # Publish unique color-coded cluster PointCloud2

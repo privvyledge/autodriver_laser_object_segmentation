@@ -8,6 +8,7 @@ from geometry_msgs.msg import Point, Vector3, Quaternion, Polygon, Point32
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA, Header
 from tf2_ros import Buffer, TransformListener
+from rcl_interfaces.msg import ParameterDescriptor, FloatingPointRange, IntegerRange, SetParametersResult
 try:
     from nav2_dynamic_msgs.msg import Obstacle, ObstacleArray
     NAV2_DYNAMIC_MSGS_AVAILABLE = True
@@ -20,38 +21,67 @@ import math
 
 from autodriver_laser_object_segmentation.laser_obstacle_detector_core import LaserObstacleDetectorCore
 
+
+def _fr(lo, hi, step, desc=''):
+    """ParameterDescriptor with a FloatingPointRange (min/max/step) for rqt_reconfigure sliders."""
+    return ParameterDescriptor(
+        description=desc,
+        floating_point_range=[FloatingPointRange(from_value=float(lo), to_value=float(hi), step=float(step))]
+    )
+
+
+def _ir(lo, hi, step=1, desc=''):
+    """ParameterDescriptor with an IntegerRange (min/max/step) for rqt_reconfigure sliders."""
+    return ParameterDescriptor(
+        description=desc,
+        integer_range=[IntegerRange(from_value=int(lo), to_value=int(hi), step=int(step))]
+    )
+
+
 class LaserObstacleDetectorNode(Node):
+    # Nominal thickness (m) given to LINE/CORNER shape primitives, which have no fitted
+    # width. Sized around the sensor's range noise; `polygon` remains authoritative.
+    LINE_THICKNESS = 0.05
+
     def __init__(self):
         super().__init__('laser_obstacle_detector')
         
         # Declare Parameters
+        # Numeric params carry a ParameterDescriptor with min/max/step so rqt_reconfigure
+        # renders sliders. Every param is re-read at the top of each scan callback, so
+        # changes (via sliders or `ros2 param set`) take effect on the next scan with no
+        # restart. Bool/string params get no range (rqt shows a checkbox / text field).
         self.declare_parameter('enable_tracking', True)
         self.declare_parameter('publish_object_array', True)
         self.declare_parameter('publish_obstacle_array', False)
-        self.declare_parameter('min_range', 0.1)
-        self.declare_parameter('max_range', 10.0)
-        self.declare_parameter('beta_incidence_deg', 10.0)
-        self.declare_parameter('sigma_r', 0.01)
-        self.declare_parameter('min_jump_distance', 0.1)
-        self.declare_parameter('max_jump_distance', 1.0)
-        self.declare_parameter('min_cluster_points', 3)
-        self.declare_parameter('max_cluster_points', 2000)
+        self.declare_parameter('min_range', 0.1, _fr(0.0, 5.0, 0.01))
+        self.declare_parameter('max_range', 10.0, _fr(0.0, 30.0, 0.01))
+        self.declare_parameter('beta_incidence_deg', 10.0, _fr(0.0, 45.0, 0.1))
+        self.declare_parameter('sigma_r', 0.01, _fr(0.0, 0.2, 0.001))
+        self.declare_parameter('min_jump_distance', 0.1, _fr(0.0, 2.0, 0.01))
+        self.declare_parameter('max_jump_distance', 1.0, _fr(0.0, 5.0, 0.01))
+        self.declare_parameter('min_cluster_points', 3, _ir(1, 50, 1))
+        self.declare_parameter('max_cluster_points', 2000, _ir(1, 5000, 1))
         self.declare_parameter('use_convex_hull', True)
-        self.declare_parameter('split_threshold', 0.05)
-        self.declare_parameter('max_association_distance', 1.0)
-        self.declare_parameter('min_track_age', 3)
-        self.declare_parameter('max_missed_frames', 5)
+        self.declare_parameter('split_threshold', 0.05, _fr(0.0, 0.5, 0.001))
+        self.declare_parameter('max_association_distance', 1.0, _fr(0.0, 5.0, 0.01))
+        self.declare_parameter('min_track_age', 3, _ir(1, 20, 1))
+        self.declare_parameter('max_missed_frames', 5, _ir(0, 30, 1))
         self.declare_parameter('publish_debug_pointcloud', True)
         self.declare_parameter('publish_debug_markers', True)
         self.declare_parameter('use_median_filter', True)
         self.declare_parameter('association_method', 'hungarian')
-        self.declare_parameter('circle_residual_ratio', 0.12)
-        self.declare_parameter('max_circle_radius', 1.0)
-        self.declare_parameter('corner_angle_min_deg', 65.0)
-        self.declare_parameter('corner_angle_max_deg', 115.0)
-        self.declare_parameter('shape_smoothing_alpha', 0.5)
+        self.declare_parameter('circle_residual_ratio', 0.12, _fr(0.0, 1.0, 0.01))
+        self.declare_parameter('max_circle_radius', 1.0, _fr(0.0, 5.0, 0.01))
+        self.declare_parameter('corner_angle_min_deg', 65.0, _fr(0.0, 180.0, 0.5))
+        self.declare_parameter('corner_angle_max_deg', 115.0, _fr(0.0, 180.0, 0.5))
+        self.declare_parameter('shape_smoothing_alpha', 0.5, _fr(0.0, 1.0, 0.01))
+        self.declare_parameter('kf_process_noise', 0.1, _fr(0.0, 2.0, 0.01))
+        self.declare_parameter('shape_type_hysteresis', 3, _ir(1, 20, 1))
         self.declare_parameter('tracking_frame', 'odom')
         self.declare_parameter('publish_unconfirmed', True)
+        self.declare_parameter('tf_fallback_to_latest', True)
+        self.declare_parameter('tf_latest_max_delay', 2.0, _fr(0.0, 10.0, 0.05))
         
         # Initialize Core
         beta_rad = math.radians(self.get_parameter('beta_incidence_deg').value)
@@ -76,7 +106,9 @@ class LaserObstacleDetectorNode(Node):
             max_circle_radius=self.get_parameter('max_circle_radius').value,
             corner_angle_min_deg=self.get_parameter('corner_angle_min_deg').value,
             corner_angle_max_deg=self.get_parameter('corner_angle_max_deg').value,
-            shape_smoothing_alpha=self.get_parameter('shape_smoothing_alpha').value
+            shape_smoothing_alpha=self.get_parameter('shape_smoothing_alpha').value,
+            kf_process_noise=self.get_parameter('kf_process_noise').value,
+            shape_type_hysteresis=self.get_parameter('shape_type_hysteresis').value
         )
         
         self.last_stamp = None
@@ -115,8 +147,19 @@ class LaserObstacleDetectorNode(Node):
                 10
             )
             
+        # Log parameter changes so live retuning (rqt_reconfigure / `ros2 param set`) gives
+        # visible feedback. Registered AFTER declares so it doesn't fire for initial values.
+        # The actual application happens in scan_callback, which re-reads every param each scan.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
         self.get_logger().info('Laser Obstacle Detector Node initialized.')
         self._nav2_warned = False
+
+    def _on_set_parameters(self, params):
+        for p in params:
+            self.get_logger().info(f"Parameter update: {p.name} = {p.value}")
+        # Accept: range validation is enforced separately by each param's descriptor.
+        return SetParametersResult(successful=True)
 
     def pack_nav2_obstacle_msg(self, detection):
         import uuid
@@ -147,6 +190,61 @@ class LaserObstacleDetectorNode(Node):
             
         return obstacle
 
+    def _lookup_tracking_transform(self, tracking_frame, source_frame, stamp, current_stamp):
+        """Look up tracking_frame<-source_frame at the exact scan stamp.
+
+        On failure (laggy/gappy TF -> extrapolation errors), optionally retry with the
+        latest-available transform (rclpy.time.Time()), accepting it only if it is no more
+        stale than `tf_latest_max_delay` seconds. Returns the TransformStamped to use, or
+        None (caller then falls back to the sensor frame). Warnings are throttled.
+        """
+        try:
+            return self.tf_buffer.lookup_transform(
+                tracking_frame,
+                source_frame,
+                stamp,
+                timeout=rclpy.duration.Duration(seconds=0.3)
+            )
+        except Exception as e_exact:
+            if not self.get_parameter('tf_fallback_to_latest').value:
+                self.get_logger().warning(
+                    f"TF lookup failed from '{tracking_frame}' to '{source_frame}': "
+                    f"{e_exact}. Falling back to sensor frame.",
+                    throttle_duration_sec=5.0
+                )
+                return None
+
+        # Exact-stamp lookup failed; try the latest-available transform.
+        try:
+            latest = self.tf_buffer.lookup_transform(
+                tracking_frame, source_frame, rclpy.time.Time()
+            )
+        except Exception as e_latest:
+            self.get_logger().warning(
+                f"TF lookup failed from '{tracking_frame}' to '{source_frame}' "
+                f"(exact and latest): {e_latest}. Falling back to sensor frame.",
+                throttle_duration_sec=5.0
+            )
+            return None
+
+        tf_time = rclpy.time.Time.from_msg(latest.header.stamp)
+        staleness = abs(current_stamp.nanoseconds - tf_time.nanoseconds) / 1e9
+        max_delay = self.get_parameter('tf_latest_max_delay').value
+        if staleness <= max_delay:
+            self.get_logger().warning(
+                f"Using latest-available TF '{tracking_frame}'<-'{source_frame}', "
+                f"stale by {staleness:.2f}s (exact-stamp lookup failed).",
+                throttle_duration_sec=5.0
+            )
+            return latest
+
+        self.get_logger().warning(
+            f"Latest TF '{tracking_frame}'<-'{source_frame}' is {staleness:.2f}s stale "
+            f"(> {max_delay:.2f}s); falling back to sensor frame.",
+            throttle_duration_sec=5.0
+        )
+        return None
+
     def scan_callback(self, msg: LaserScan):
         # Calculate dynamic dt
         dt = self.core.dt
@@ -166,37 +264,26 @@ class LaserObstacleDetectorNode(Node):
         out_frame_id = msg.header.frame_id
         
         if tracking_frame:
-            try:
-                # Target frame: tracking_frame, source frame: msg.header.frame_id
-                trans = self.tf_buffer.lookup_transform(
-                    tracking_frame,
-                    msg.header.frame_id,
-                    msg.header.stamp,
-                    timeout=rclpy.duration.Duration(seconds=0.02)
-                )
-                
+            trans = self._lookup_tracking_transform(
+                tracking_frame, msg.header.frame_id, msg.header.stamp, current_stamp
+            )
+            if trans is not None:
                 tx = trans.transform.translation.x
                 ty = trans.transform.translation.y
-                
+
                 # Quaternion to yaw
                 qx = trans.transform.rotation.x
                 qy = trans.transform.rotation.y
                 qz = trans.transform.rotation.z
                 qw = trans.transform.rotation.w
-                
+
                 siny_cosp = 2.0 * (qw * qz + qx * qy)
                 cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
                 yaw = math.atan2(siny_cosp, cosy_cosp)
-                
+
                 sensor_pose = (tx, ty, yaw)
                 out_frame_id = tracking_frame
-            except Exception as e:
-                # Log a throttled warning on fallback
-                self.get_logger().warning(
-                    f"TF lookup failed from '{tracking_frame}' to '{msg.header.frame_id}': {e}. Falling back to sensor frame.",
-                    throttle_duration_sec=5.0
-                )
-                
+
         # Update core parameters dynamically (if updated via dynamic reconfigure / parameters)
         self.core.min_range = self.get_parameter('min_range').value
         self.core.max_range = self.get_parameter('max_range').value
@@ -218,7 +305,9 @@ class LaserObstacleDetectorNode(Node):
         self.core.corner_angle_min_deg = self.get_parameter('corner_angle_min_deg').value
         self.core.corner_angle_max_deg = self.get_parameter('corner_angle_max_deg').value
         self.core.shape_smoothing_alpha = self.get_parameter('shape_smoothing_alpha').value
-        
+        self.core.kf_process_noise = self.get_parameter('kf_process_noise').value
+        self.core.shape_type_hysteresis = self.get_parameter('shape_type_hysteresis').value
+
         enable_tracking = self.get_parameter('enable_tracking').value
         publish_object_array = self.get_parameter('publish_object_array').value
         publish_obstacle_array = self.get_parameter('publish_obstacle_array').value
@@ -235,14 +324,16 @@ class LaserObstacleDetectorNode(Node):
         
         out_header = Header(stamp=msg.header.stamp, frame_id=out_frame_id)
         
+        # Select which tracks to visualize/publish. Defined unconditionally so the
+        # debug-marker path is safe even when tracking is disabled (active_tracks is
+        # empty in that case, so no markers are produced).
+        if self.get_parameter('publish_unconfirmed').value:
+            tracks_to_publish = active_tracks
+        else:
+            tracks_to_publish = [t for t in active_tracks if t.is_confirmed]
+
         # 1. Publish Obstacles (Tracks)
         if publish_object_array and enable_tracking:
-            publish_unconfirmed = self.get_parameter('publish_unconfirmed').value
-            if publish_unconfirmed:
-                tracks_to_publish = active_tracks
-            else:
-                tracks_to_publish = [t for t in active_tracks if t.is_confirmed]
-                
             obj_array = ObjectArray()
             obj_array.header = out_header
             
@@ -257,26 +348,43 @@ class LaserObstacleDetectorNode(Node):
                 obj.pose.position = Point(x=track.x[0], y=track.x[1], z=0.0)
                 
                 # Orientation
+                yaw = 0.0
                 if track.shape_type == 1: # BOX
                     yaw = track.shape_dims[2]
-                    cy = math.cos(yaw * 0.5)
-                    sy = math.sin(yaw * 0.5)
-                    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=sy, w=cy)
-                else:
-                    obj.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-                    
+                elif track.shape_type == 2 and len(track.polygon) >= 2: # LINE: along the segment
+                    p_start, p_end = track.polygon[0], track.polygon[-1]
+                    yaw = math.atan2(p_end[1] - p_start[1], p_end[0] - p_start[0])
+                obj.pose.orientation = Quaternion(
+                    x=0.0, y=0.0, z=math.sin(yaw * 0.5), w=math.cos(yaw * 0.5))
+
                 # Velocity
                 obj.twist.linear = Vector3(x=track.x[2], y=track.x[3], z=0.0)
                 obj.twist.angular = Vector3(x=0.0, y=0.0, z=0.0)
-                
-                # Shape
+
+                # Shape. LINE/CORNER carry no fitted dims -- their geometry lives in
+                # `polygon`, which is authoritative. Derive a coarse bound centred on the
+                # published pose so consumers get a well-formed primitive rather than a
+                # default-constructed one.
                 if track.shape_type == 0: # CIRCLE
                     obj.shape.type = SolidPrimitive.CYLINDER
                     obj.shape.dimensions = [0.5, track.shape_dims[0]]
                 elif track.shape_type == 1: # BOX
                     obj.shape.type = SolidPrimitive.BOX
                     obj.shape.dimensions = [track.shape_dims[0], track.shape_dims[1], 0.5]
-                    
+                elif track.shape_type == 2 and len(track.polygon) >= 2: # LINE -> thin BOX
+                    p_start, p_end = track.polygon[0], track.polygon[-1]
+                    length = math.hypot(p_end[0] - p_start[0], p_end[1] - p_start[1])
+                    obj.shape.type = SolidPrimitive.BOX
+                    obj.shape.dimensions = [length, self.LINE_THICKNESS, 0.5]
+                elif track.shape_type == 3 and len(track.polygon) >= 1: # CORNER -> enclosing BOX
+                    # pose is the corner vertex, not a box centre, so size the box to
+                    # enclose every vertex symmetrically about it.
+                    half_x = max(abs(p[0] - track.x[0]) for p in track.polygon)
+                    half_y = max(abs(p[1] - track.x[1]) for p in track.polygon)
+                    obj.shape.type = SolidPrimitive.BOX
+                    obj.shape.dimensions = [max(2.0 * half_x, self.LINE_THICKNESS),
+                                            max(2.0 * half_y, self.LINE_THICKNESS), 0.5]
+
                 # Polygon
                 poly = Polygon()
                 for pt in track.polygon:
@@ -309,9 +417,13 @@ class LaserObstacleDetectorNode(Node):
             pc_msg = self.make_color_pc2(msg.header, clusters)
             self.pc_pub.publish(pc_msg)
             
-        # 3. Publish Debug Markers
+        # 3. Publish Debug Markers. With tracking on, markers come from tracks; with tracking
+        # off there are no tracks, so render the raw per-frame detections instead.
         if self.publish_markers:
-            self.publish_debug_markers(out_header, tracks_to_publish)
+            if enable_tracking:
+                self.publish_debug_markers(out_header, tracks_to_publish)
+            else:
+                self.publish_debug_markers_detections(out_header, detections)
 
     def make_color_pc2(self, header, clusters):
         fields = [
@@ -414,15 +526,26 @@ class LaserObstacleDetectorNode(Node):
             border_marker.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
             border_marker.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
             border_marker.action = Marker.ADD
-            
-            for pt in track.polygon:
-                border_marker.points.append(Point(x=float(pt[0]), y=float(pt[1]), z=0.0))
-                
-            # If circle, box or convex hull, close the polygon loop
-            if track.shape_type in [0, 1] or self.core.use_convex_hull:
-                if len(track.polygon) > 0:
-                    border_marker.points.append(Point(x=float(track.polygon[0][0]), y=float(track.polygon[0][1]), z=0.0))
-                    
+
+            # For primitive shapes, regenerate the outline from the tracked
+            # (KF-smoothed) center + smoothed dims so it coincides with the filled
+            # shape marker (the raw per-frame polygon otherwise wobbles off-center).
+            # For line/corner/hull, use the raw detection polygon.
+            if track.shape_type == 0:  # CIRCLE: ring at smoothed radius around track center
+                cx, cy, rad = track.x[0], track.x[1], track.shape_dims[0]
+                for k in range(17):
+                    a = 2.0 * math.pi * (k % 16) / 16.0
+                    border_marker.points.append(Point(x=cx + rad*math.cos(a), y=cy + rad*math.sin(a), z=0.0))
+            elif track.shape_type == 1:  # BOX: rectangle from smoothed dims/yaw
+                cx, cy = track.x[0], track.x[1]
+                hl, hw, yaw = track.shape_dims[0]*0.5, track.shape_dims[1]*0.5, track.shape_dims[2]
+                c, s = math.cos(yaw), math.sin(yaw)
+                for lx, ly in [(-hl, -hw), (hl, -hw), (hl, hw), (-hl, hw), (-hl, -hw)]:
+                    border_marker.points.append(Point(x=cx + lx*c - ly*s, y=cy + lx*s + ly*c, z=0.0))
+            else:  # LINE / CORNER: raw detection polygon
+                for pt in track.polygon:
+                    border_marker.points.append(Point(x=float(pt[0]), y=float(pt[1]), z=0.0))
+
             if len(border_marker.points) > 1:
                 marker_array.markers.append(border_marker)
                 
@@ -457,10 +580,91 @@ class LaserObstacleDetectorNode(Node):
             text_marker.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
             text_marker.action = Marker.ADD
             
-            # Label content
-            text_marker.text = f"ID: {track.id} | V: {vel_norm:.1f} m/s"
+            # Label content (compact; velocity only when moving)
+            text_marker.text = f"ID:{track.id} {vel_norm:.1f}" if vel_norm > 0.1 else f"ID:{track.id}"
             marker_array.markers.append(text_marker)
-            
+
+        self.marker_pub.publish(marker_array)
+
+    def publish_debug_markers_detections(self, header, detections):
+        """Render per-frame detections (used when enable_tracking=False, so there are no
+        tracks). Detections carry no id/velocity: color/id are synthesized from the list
+        index and no velocity arrows are drawn. Circle/box outlines are regenerated from
+        centroid+dims (matching the tracked-marker path); line/corner use the raw polygon.
+        Keep in sync with publish_debug_markers() and the C++ node's equivalent.
+        """
+        marker_array = MarkerArray()
+
+        # Clear previous markers
+        clear_marker = Marker()
+        clear_marker.action = Marker.DELETEALL
+        marker_array.markers.append(clear_marker)
+
+        SHAPE_ID = 1000
+        BORDER_ID = 4000
+
+        for i, det in enumerate(detections):
+            shape_type, centroid, dims, polygon = det
+            cx, cy = float(centroid[0]), float(centroid[1])
+
+            # Color based on detection index (no track id available)
+            r = (13 * i) % 256 / 255.0
+            g = (57 * i) % 256 / 255.0
+            b = (127 * i) % 256 / 255.0
+            color = ColorRGBA(r=r, g=g, b=b, a=0.7)
+
+            # --- 1. Shape Marker (Cylinder / Box) ---
+            shape_marker = Marker()
+            shape_marker.header = header
+            shape_marker.ns = "shapes"
+            shape_marker.id = SHAPE_ID + i
+            shape_marker.color = color
+            shape_marker.pose.position = Point(x=cx, y=cy, z=0.0)
+
+            if shape_type == 0:  # CIRCLE
+                shape_marker.type = Marker.CYLINDER
+                shape_marker.scale = Vector3(x=dims[0]*2.0, y=dims[0]*2.0, z=0.2)
+                shape_marker.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+                shape_marker.action = Marker.ADD
+                marker_array.markers.append(shape_marker)
+            elif shape_type == 1:  # BOX
+                shape_marker.type = Marker.CUBE
+                shape_marker.scale = Vector3(x=dims[0], y=dims[1], z=0.2)
+                yaw = dims[2]
+                cyq = math.cos(yaw * 0.5)
+                syq = math.sin(yaw * 0.5)
+                shape_marker.pose.orientation = Quaternion(x=0.0, y=0.0, z=syq, w=cyq)
+                shape_marker.action = Marker.ADD
+                marker_array.markers.append(shape_marker)
+
+            # --- 2. Outline / Border Marker (Polygon) ---
+            border_marker = Marker()
+            border_marker.header = header
+            border_marker.ns = "outlines"
+            border_marker.id = BORDER_ID + i
+            border_marker.type = Marker.LINE_STRIP
+            border_marker.scale.x = 0.03
+            border_marker.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
+            border_marker.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+            border_marker.action = Marker.ADD
+
+            if shape_type == 0:  # CIRCLE: ring at radius around centroid
+                rad = dims[0]
+                for k in range(17):
+                    a = 2.0 * math.pi * (k % 16) / 16.0
+                    border_marker.points.append(Point(x=cx + rad*math.cos(a), y=cy + rad*math.sin(a), z=0.0))
+            elif shape_type == 1:  # BOX: rectangle from dims/yaw
+                hl, hw, yaw = dims[0]*0.5, dims[1]*0.5, dims[2]
+                c, s = math.cos(yaw), math.sin(yaw)
+                for lx, ly in [(-hl, -hw), (hl, -hw), (hl, hw), (-hl, hw), (-hl, -hw)]:
+                    border_marker.points.append(Point(x=cx + lx*c - ly*s, y=cy + lx*s + ly*c, z=0.0))
+            else:  # LINE / CORNER: raw detection polygon
+                for pt in polygon:
+                    border_marker.points.append(Point(x=float(pt[0]), y=float(pt[1]), z=0.0))
+
+            if len(border_marker.points) > 1:
+                marker_array.markers.append(border_marker)
+
         self.marker_pub.publish(marker_array)
 
 def main(args=None):

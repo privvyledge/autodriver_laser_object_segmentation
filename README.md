@@ -11,7 +11,7 @@ It contains a dual-language implementation with mirror algorithms in both C++ an
 ## Architecture & Algorithm Pipeline
 
 1. **Preprocessing:** Optionally applies a 1D median filter (window size = 3, toggled by `use_median_filter`) to suppress salt-and-pepper noise, filters points outside sensor/user ranges (`min_range` to `max_range`), and projects valid beams to 2D Cartesian coordinates. All preprocessing, clustering, and shape fitting happen in the **sensor frame**.
-2. **Clustering:** Performs range-adaptive **Sequential Jump Distance Clustering (JDC)** based on the Dietmayer formula to segment adjacent points into clusters, handling wrap-around for 360° scans (vectorized).
+2. **Clustering:** Performs range-adaptive **Sequential Jump Distance Clustering (JDC)** based on the Dietmayer formula [1] to segment adjacent points into clusters, handling wrap-around for 360° scans (vectorized).
 3. **Shape Fitting:** Fits multiple geometric models to clusters:
    - **Circle:** Least-squares circle fitting (Kasa method).
    - **Oriented Bounding Box (OBB):** Minimum-area box via **rotating calipers** on the convex hull (exact, no angular quantization).
@@ -68,6 +68,8 @@ Configurable parameters are declared in [config/params.yaml](config/params.yaml)
 | **`max_missed_frames`** | `int` | `5` | Allowable consecutive missed updates before deleting a track. |
 | **`publish_unconfirmed`** | `bool` | `true` | Also publish tentative (unconfirmed) tracks as `OBJECT_DETECTED`. |
 | **`shape_smoothing_alpha`** | `double` | `0.5` | EMA coefficient on shape dimensions (`1.0` = no smoothing). |
+| **`kf_process_noise`** | `double` | `0.1` | Kalman process noise `q`. Lower = smoother tracks and less phantom velocity on static objects; raise if fast dynamic obstacles lag. |
+| **`shape_type_hysteresis`** | `int` | `3` | A track must observe a differing shape type this many consecutive frames before switching (`1` = off). Suppresses circle↔box↔line flicker; use `5` for near-zero flips. |
 | **`publish_debug_pointcloud`** | `bool` | `true` | Flag to publish colorized point cloud clusters on `debug_clusters`. |
 | **`publish_debug_markers`** | `bool` | `true` | Flag to publish RViz visualization markers on `debug_markers`. |
 
@@ -119,4 +121,18 @@ Run the perception system using the provided launch file [launch/obstacle_detect
   ros2 launch autodriver_laser_object_segmentation obstacle_detector.launch.py params_file:=/path/to/custom_params.yaml
   ```
 
+### Replay a recorded rosbag
+For F1TENTH test bags, [scripts/run_bag_test.sh](scripts/run_bag_test.sh) launches the C++ node + RViz2 with simulated time and the standard `/gosling1/...` → `scan` / `/tf` / `/odom` remaps, then plays the bag. It auto-detects `no_localization` bags and publishes a static `odom → base_link` transform for them:
+```bash
+./src/autodriver_laser_object_segmentation/scripts/run_bag_test.sh \
+  /mnt/d/Coding/Projects/f1tenth/test_bags_05252026/stationary_with_localization_and_pointcloud
+```
+Stationary bags isolate detector/tracker behavior from ego-motion. See [TESTS.md](TESTS.md) §9 for details.
+
 For cloning, dependency install, unit tests, and running against namespaced topics (with TF remaps for ego-motion-aware tracking), see [TESTS.md](TESTS.md).
+
+---
+
+## References
+
+* **[1]** Dietmayer, K. C., Sparr, M., & Fürstenberg, K. C. (2001). "Road users classification by obstacles detection and tracking". In *Proceedings of the IEEE Intelligent Vehicles Symposium (IV)* (pp. 53-58).

@@ -344,6 +344,39 @@ class TestLaserObstacleDetectorCore(unittest.TestCase):
             self.assertAlmostEqual(cwid.value, fit_size[1], places=5)
             self.assertAlmostEqual(cyaw.value, fit_yaw, places=5)
 
+    def test_circle_kasa_accuracy(self):
+        # Arcs are deliberately asymmetric (not centred on an axis) and off-origin.
+        # An arc symmetric about an axis zeroes the sum(u*v) / sum(v) terms and so
+        # agrees between implementations even when the normal-equation solve is wrong.
+        for true_r, cx, cy in [(0.7, 1.0, 2.0), (0.9, -2.0, 0.5), (5.0, 3.0, -4.0)]:
+            theta = np.linspace(0.3, 1.9, 12)
+            pts = np.column_stack((cx + true_r * np.cos(theta), cy + true_r * np.sin(theta)))
+
+            py_center, py_radius = self.detector.fit_circle_kasa(pts)
+            self.assertAlmostEqual(py_center[0], cx, places=5)
+            self.assertAlmostEqual(py_center[1], cy, places=5)
+            self.assertAlmostEqual(py_radius, true_r, places=5)
+
+            lib = load_cpp_lib()
+            if lib is not None:
+                lib.test_circle_kasa.argtypes = [
+                    ctypes.POINTER(ctypes.c_double),
+                    ctypes.POINTER(ctypes.c_double),
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_double),
+                    ctypes.POINTER(ctypes.c_double),
+                    ctypes.POINTER(ctypes.c_double)
+                ]
+                px = (ctypes.c_double * len(pts))(*pts[:, 0])
+                pyy = (ctypes.c_double * len(pts))(*pts[:, 1])
+                ccx, ccy, cr = ctypes.c_double(0), ctypes.c_double(0), ctypes.c_double(0)
+
+                lib.test_circle_kasa(px, pyy, len(pts), ctypes.byref(ccx), ctypes.byref(ccy), ctypes.byref(cr))
+
+                self.assertAlmostEqual(ccx.value, py_center[0], delta=1e-9)
+                self.assertAlmostEqual(ccy.value, py_center[1], delta=1e-9)
+                self.assertAlmostEqual(cr.value, py_radius, delta=1e-9)
+
     def test_ego_motion(self):
         wall_pts_sensor_frame_1 = np.column_stack((
             np.linspace(1.0, 3.0, 10),
@@ -446,6 +479,30 @@ class TestLaserObstacleDetectorCore(unittest.TestCase):
         
         self.detector.process([3.0]*10, 0.0, 0.1, dt=0.1)
         self.assertTrue(self.detector.tracks[0].is_confirmed)
+
+    def test_shape_type_hysteresis(self):
+        from autodriver_laser_object_segmentation.laser_obstacle_detector_core import Track
+        # hysteresis=3: a differing type must persist 3 consecutive frames to switch.
+        tr = Track(1, [0.0, 0.0], 0, [0.5], [], dt=0.1,
+                   shape_smoothing_alpha=1.0, kf_process_noise=0.1, shape_type_hysteresis=3)
+        # Two transient BOX frames must NOT flip the type away from CIRCLE.
+        tr.update([0.0, 0.0], 1, [0.4, 0.3, 0.0], [])
+        self.assertEqual(tr.shape_type, 0)
+        tr.update([0.0, 0.0], 1, [0.4, 0.3, 0.0], [])
+        self.assertEqual(tr.shape_type, 0)
+        # Third consecutive BOX frame confirms the switch.
+        tr.update([0.0, 0.0], 1, [0.4, 0.3, 0.0], [])
+        self.assertEqual(tr.shape_type, 1)
+        # A single stray CIRCLE frame is rejected (counter resets, stays BOX).
+        tr.update([0.0, 0.0], 0, [0.5], [])
+        self.assertEqual(tr.shape_type, 1)
+
+    def test_hysteresis_disabled_by_default(self):
+        from autodriver_laser_object_segmentation.laser_obstacle_detector_core import Track
+        # Default hysteresis=1 => switch immediately (preserves legacy behavior).
+        tr = Track(1, [0.0, 0.0], 0, [0.5], [], dt=0.1)
+        tr.update([0.0, 0.0], 1, [0.4, 0.3, 0.0], [])
+        self.assertEqual(tr.shape_type, 1)
 
 if __name__ == '__main__':
     unittest.main()
