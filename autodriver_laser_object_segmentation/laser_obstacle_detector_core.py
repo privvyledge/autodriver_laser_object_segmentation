@@ -5,6 +5,129 @@ import scipy.signal
 import scipy.optimize
 
 
+def _point_segment_distance(point, start, end):
+    point = np.asarray(point, dtype=float)
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+    delta = end - start
+    length_sq = float(np.dot(delta, delta))
+    if length_sq <= 1e-18:
+        return float(np.linalg.norm(point - start))
+    amount = float(np.clip(np.dot(point - start, delta) / length_sq, 0.0, 1.0))
+    return float(np.linalg.norm(point - (start + amount * delta)))
+
+
+def _point_in_polygon(point, polygon):
+    inside = False
+    x, y = point
+    previous = polygon[-1]
+    for current in polygon:
+        if ((current[1] > y) != (previous[1] > y)):
+            x_cross = ((previous[0] - current[0]) * (y - current[1])
+                       / (previous[1] - current[1]) + current[0])
+            if x < x_cross:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def _polygon_min_distance(poly_a, poly_b):
+    """Minimum separation of point, segment, or closed-polygon geometry."""
+    a = np.asarray(poly_a, dtype=float).reshape((-1, 2))
+    b = np.asarray(poly_b, dtype=float).reshape((-1, 2))
+    if len(a) == 0 or len(b) == 0:
+        return math.inf
+    if len(a) >= 3 and _point_in_polygon(b[0], a):
+        return 0.0
+    if len(b) >= 3 and _point_in_polygon(a[0], b):
+        return 0.0
+
+    def segments(poly):
+        if len(poly) == 1:
+            return poly, poly
+        starts, ends = poly[:-1], poly[1:]
+        if len(poly) >= 3:
+            starts = np.vstack((starts, poly[-1]))
+            ends = np.vstack((ends, poly[0]))
+        return starts, ends
+
+    a0, a1 = segments(a)
+    b0, b1 = segments(b)
+    p = a0[:, None, :]
+    p2 = a1[:, None, :]
+    q = b0[None, :, :]
+    q2 = b1[None, :, :]
+
+    def cross(left, right):
+        return left[..., 0] * right[..., 1] - left[..., 1] * right[..., 0]
+
+    ar = p2 - p
+    br = q2 - q
+    o1 = cross(ar, q - p)
+    o2 = cross(ar, q2 - p)
+    o3 = cross(br, p - q)
+    o4 = cross(br, p2 - q)
+    eps = 1e-12
+    strict = (((o1 > eps) & (o2 < -eps)) | ((o1 < -eps) & (o2 > eps))) \
+             & (((o3 > eps) & (o4 < -eps)) | ((o3 < -eps) & (o4 > eps)))
+
+    def within(point, start, end):
+        return ((point[..., 0] >= np.minimum(start[..., 0], end[..., 0]) - eps)
+                & (point[..., 0] <= np.maximum(start[..., 0], end[..., 0]) + eps)
+                & (point[..., 1] >= np.minimum(start[..., 1], end[..., 1]) - eps)
+                & (point[..., 1] <= np.maximum(start[..., 1], end[..., 1]) + eps))
+
+    touching = ((np.abs(o1) <= eps) & within(q, p, p2)) \
+        | ((np.abs(o2) <= eps) & within(q2, p, p2)) \
+        | ((np.abs(o3) <= eps) & within(p, q, q2)) \
+        | ((np.abs(o4) <= eps) & within(p2, q, q2))
+    if np.any(strict | touching):
+        return 0.0
+
+    def point_to_segments(points, starts, ends):
+        delta = ends - starts
+        length_sq = np.sum(delta * delta, axis=-1)
+        safe_length_sq = np.where(length_sq > 1e-18, length_sq, 1.0)
+        amount = np.clip(np.sum((points - starts) * delta, axis=-1)
+                         / safe_length_sq, 0.0, 1.0)
+        closest = starts + amount[..., None] * delta
+        return np.linalg.norm(points - closest, axis=-1)
+
+    return float(min(np.min(point_to_segments(p, q, q2)),
+                     np.min(point_to_segments(p2, q, q2)),
+                     np.min(point_to_segments(q, p, p2)),
+                     np.min(point_to_segments(q2, p, p2))))
+
+
+def _polygon_overlap_cost(detection_polygon, track_polygon, epsilon):
+    """Asymmetric unmatched-vertex fraction for the secondary association candidate."""
+    detection = np.asarray(detection_polygon, dtype=float).reshape((-1, 2))
+    track = np.asarray(track_polygon, dtype=float).reshape((-1, 2))
+    if len(detection) == 0 or len(track) == 0:
+        return 1.0
+    if len(track) == 1:
+        distances = np.linalg.norm(detection - track[0], axis=1)
+    else:
+        starts, ends = track[:-1], track[1:]
+        if len(track) >= 3:
+            starts = np.vstack((starts, track[-1]))
+            ends = np.vstack((ends, track[0]))
+        points = detection[:, None, :]
+        starts = starts[None, :, :]
+        ends = ends[None, :, :]
+        delta = ends - starts
+        length_sq = np.sum(delta * delta, axis=-1)
+        safe_length_sq = np.where(length_sq > 1e-18, length_sq, 1.0)
+        amount = np.clip(np.sum((points - starts) * delta, axis=-1)
+                         / safe_length_sq, 0.0, 1.0)
+        closest = starts + amount[..., None] * delta
+        distances = np.min(np.linalg.norm(points - closest, axis=-1), axis=1)
+        if len(track) >= 3:
+            inside = [_point_in_polygon(point, track) for point in detection]
+            distances[inside] = 0.0
+    return 1.0 - float(np.count_nonzero(distances <= epsilon)) / len(detection)
+
+
 class Track:
     def __init__(self, track_id, position, shape_type, shape_dims, polygon, dt,
                  shape_smoothing_alpha=1.0, kf_process_noise=0.5, shape_type_hysteresis=1):
@@ -32,6 +155,7 @@ class Track:
         self.shape_type = shape_type     # 0: CIRCLE, 1: BOX, 2: LINE, 3: CORNER
         self.shape_dims = shape_dims     # list: [radius] or [length, width, height]
         self.polygon = polygon           # List of [x, y] coordinates representing shape boundary
+        self.poly_ref = self.x[:2].copy()
 
         self.shape_smoothing_alpha = shape_smoothing_alpha
         # Shape-type hysteresis: a matched detection must report a differing shape type
@@ -149,6 +273,7 @@ class Track:
             
         self.shape_type = shape_type
         self.polygon = polygon
+        self.poly_ref = self.x[:2].copy()
         
         self.age += 1
         self.missed_frames = 0
@@ -172,6 +297,9 @@ class LaserObstacleDetectorCore:
                  dt=0.1,
                  use_median_filter=True,
                  association_method="hungarian",
+                 association_cost="centroid",
+                 max_polygon_association_distance=0.4,
+                 geom_prefilter_distance=2.5,
                  circle_residual_ratio=0.12,
                  max_circle_radius=1.0,
                  corner_angle_min_deg=65.0,
@@ -198,6 +326,9 @@ class LaserObstacleDetectorCore:
         self.dt = dt
         self.use_median_filter = use_median_filter
         self.association_method = association_method
+        self.association_cost = association_cost
+        self.max_polygon_association_dist = max_polygon_association_distance
+        self.geom_prefilter_dist = geom_prefilter_distance
         self.circle_residual_ratio = circle_residual_ratio
         self.max_circle_radius = max_circle_radius
         self.corner_angle_min_deg = corner_angle_min_deg
@@ -208,6 +339,34 @@ class LaserObstacleDetectorCore:
 
         self.tracks = []
         self.next_track_id = 1
+
+    def _association_cost_matrix(self, detected_obstacles):
+        det_centroids = np.asarray([det[1] for det in detected_obstacles])
+        track_positions = np.asarray([track.x[:2] for track in self.tracks])
+        centroid_cost = scipy.spatial.distance.cdist(det_centroids, track_positions)
+        if self.association_cost == "centroid":
+            return centroid_cost
+        if self.association_cost not in {"polygon", "overlap"}:
+            raise ValueError(f"unknown association_cost: {self.association_cost!r}")
+
+        costs = np.full_like(centroid_cost, 1e9)
+        for d_idx, detection in enumerate(detected_obstacles):
+            det_polygon = detection[3]
+            if not det_polygon:
+                continue
+            for t_idx, track in enumerate(self.tracks):
+                if centroid_cost[d_idx, t_idx] > self.geom_prefilter_dist or not track.polygon:
+                    continue
+                offset = track.x[:2] - track.poly_ref
+                predicted_polygon = np.asarray(track.polygon, dtype=float) + offset
+                if self.association_cost == "polygon":
+                    costs[d_idx, t_idx] = _polygon_min_distance(
+                        det_polygon, predicted_polygon)
+                else:
+                    costs[d_idx, t_idx] = _polygon_overlap_cost(
+                        det_polygon, predicted_polygon,
+                        self.max_polygon_association_dist)
+        return costs
 
     def preprocess_scan(self, ranges, angle_min, angle_increment):
         """
@@ -587,24 +746,27 @@ class LaserObstacleDetectorCore:
             self.tracks = active_tracks
             return
             
-        det_centroids = np.array([det[1] for det in detected_obstacles])
-        track_positions = np.array([track.x[:2] for track in self.tracks])
-        
         matched_detections = set()
         matched_tracks = set()
         
         if len(self.tracks) > 0:
-            C = scipy.spatial.distance.cdist(det_centroids, track_positions)
+            C = self._association_cost_matrix(detected_obstacles)
+            if self.association_cost == "polygon":
+                association_gate = self.max_polygon_association_dist
+            elif self.association_cost == "overlap":
+                association_gate = 1.0
+            else:
+                association_gate = self.max_association_dist
             
             if self.association_method == "hungarian":
                 C_gated = np.copy(C)
-                gate_mask = C_gated > self.max_association_dist
+                gate_mask = C_gated > association_gate
                 C_gated[gate_mask] = 1e9
                 
                 row_ind, col_ind = scipy.optimize.linear_sum_assignment(C_gated)
                 
                 for r, c in zip(row_ind, col_ind):
-                    if C[r, c] < self.max_association_dist:
+                    if C[r, c] < association_gate:
                         matched_detections.add(r)
                         matched_tracks.add(c)
                         shape_type, centroid, dims, polygon = detected_obstacles[r]
@@ -615,7 +777,7 @@ class LaserObstacleDetectorCore:
                 for d_idx in range(len(detected_obstacles)):
                     for t_idx in range(len(self.tracks)):
                         dist = C[d_idx, t_idx]
-                        if dist < self.max_association_dist:
+                        if dist < association_gate:
                             associations.append((dist, d_idx, t_idx))
                             
                 associations.sort(key=lambda x: x[0])

@@ -11,6 +11,10 @@ import scipy.spatial
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from autodriver_laser_object_segmentation.laser_obstacle_detector_core import LaserObstacleDetectorCore
+from autodriver_laser_object_segmentation.laser_obstacle_detector_core import (
+    _polygon_min_distance,
+    _polygon_overlap_cost,
+)
 
 def load_cpp_lib():
     paths = [
@@ -465,6 +469,46 @@ class TestLaserObstacleDetectorCore(unittest.TestCase):
             match_py = {r: c for r, c in zip(row_py, col_py)}
             for i in range(3):
                 self.assertEqual(col_cpp[i], match_py[row_cpp[i]])
+
+    def test_polygon_min_distance(self):
+        cases = [
+            ([[0.2, 1.1], [2.4, -0.3]], [[0.1, -0.2], [1.7, 1.4]], 0.0),
+            ([[0.0, 0.0], [1.3, 0.2]], [[1.3, 0.2], [2.1, 1.7]], 0.0),
+            ([[0.0, 0.0], [1.1, 0.2]], [[2.0, 0.7], [2.4, 1.5]], None),
+            ([[-0.3, -0.2], [2.0, 0.1], [0.4, 2.2]],
+             [[0.2, 0.3], [0.5, 0.4], [0.3, 0.8]], 0.0),
+        ]
+        for left, right, expected in cases:
+            distance = _polygon_min_distance(left, right)
+            if expected is None:
+                self.assertGreater(distance, 0.0)
+            else:
+                self.assertAlmostEqual(distance, expected, places=12)
+
+    def test_polygon_association_motion_compensation(self):
+        polygon = [[0.0, -0.2], [1.0, -0.2], [1.0, 0.2], [0.0, 0.2]]
+        for method in ("hungarian", "greedy"):
+            detector = LaserObstacleDetectorCore(
+                min_track_age=1,
+                association_method=method,
+                association_cost="polygon",
+                max_polygon_association_distance=0.2,
+                geom_prefilter_distance=3.0,
+            )
+            detector.associate_and_track(
+                [(1, np.array([0.5, 0.0]), [1.0, 0.4, 0.0], polygon)])
+            track = detector.tracks[0]
+            track.x[2] = 1.0
+            moved = [[p[0] + 0.1, p[1]] for p in polygon]
+            detector.associate_and_track(
+                [(1, np.array([0.6, 0.0]), [1.0, 0.4, 0.0], moved)], dt=0.1)
+            self.assertEqual(len(detector.tracks), 1)
+            self.assertEqual(detector.next_track_id, 2)
+
+    def test_polygon_overlap_cost_is_detection_asymmetric(self):
+        track = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]
+        detection = [[0.1, 0.1], [1.0, 1.0], [2.4, 2.4]]
+        self.assertAlmostEqual(_polygon_overlap_cost(detection, track, 0.05), 1.0 / 3.0)
 
     def test_detection_level(self):
         self.detector.tracks = []
