@@ -94,12 +94,42 @@ Measured on an x86 development host after vectorization of the clustering, shape
 
 ---
 
+## Installation
+
+Tested on **ROS 2 Humble**. The GitHub repository *is* the package, so clone it directly into a
+workspace `src/`.
+
+### 1. Clone
+```bash
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+git clone https://github.com/privvyledge/autodriver_laser_object_segmentation.git
+```
+
+### 2. Install dependencies
+All dependencies (`derived_object_msgs`, `python3-scipy`, `tf2_ros`, etc.) are declared in
+`package.xml`, so `rosdep` resolves them:
+```bash
+source /opt/ros/humble/setup.bash
+cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+### 3. Build
+```bash
+cd ~/ros2_ws
+colcon build --packages-select autodriver_laser_object_segmentation --symlink-install
+source install/setup.bash
+```
+
+---
+
 ## Building and Running
 
 ### Build
-To build the package in your ROS 2 workspace:
+To rebuild the package after changes:
 ```bash
-colcon build --packages-select autodriver_laser_object_segmentation
+colcon build --packages-select autodriver_laser_object_segmentation --symlink-install
 source install/setup.bash
 ```
 
@@ -129,7 +159,7 @@ For F1TENTH test bags, [scripts/run_bag_test.sh](scripts/run_bag_test.sh) launch
 ```
 Stationary bags isolate detector/tracker behavior from ego-motion. See [TESTS.md](TESTS.md) §9 for details.
 
-For cloning, dependency install, unit tests, and running against namespaced topics (with TF remaps for ego-motion-aware tracking), see [TESTS.md](TESTS.md).
+For unit tests and running against namespaced topics (with TF remaps for ego-motion-aware tracking), see [TESTS.md](TESTS.md).
 
 ---
 
