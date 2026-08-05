@@ -21,6 +21,12 @@ trivially won by trusting measurements less (--kf-r high) or by process noise
 tracking. Do not tune kf_process_noise or the KF measurement noise against this
 bag alone; it supplies only one side of the tradeoff.
 
+The stationary-ego / moving-obstacle bag recorded 2026-08-05 supplies the other
+side: the car is stationary while a person moves obstacles through the scene,
+so it holds a static population and a moving one at once. Score it with
+--export-movers / --movers-file (below) rather than with v95/vmax, which mix
+real and false velocity once a bag contains both.
+
 Usage:
     python test/replay_core.py                                  # baseline
     python test/replay_core.py --inject "x0=2,y0=-2,vx=0,vy=1,r=0.15"
@@ -42,6 +48,30 @@ the bag's own TF or every static obstacle is tracked at -v_ego:
         --tf-topic /gosling1/tf --tf-static-topic /gosling1/tf_static \
         --tracking-frame odom --movers 10
 
+A bag that contains real moving objects can score both sides of a smoothing
+change, which the stationary bag above cannot. Derive mover annotations from a
+reference run, then score every configuration against that fixed set:
+
+    python test/replay_core.py <bag args> --export-movers movers.json
+    python test/replay_core.py <bag args> --movers-file movers.json \
+        --kf-r 0.03,0.05,0.07,0.10
+
+The annotations are baseline-derived, not independent truth: the row whose
+configuration produced them is marked [REFERENCE] and scores itself perfectly
+(recall 1.000, pos_rmse 0.000). Compare the other rows against each other. Note
+a --sweep value that reproduces the baseline (e.g. beta_incidence_deg=10 when
+the yaml already says 10) is that same reference configuration and scores the
+same way, without carrying the label.
+
+Mover columns (--movers-file):
+    recall    fraction of annotated mover-frames with a confirmed track within 0.5 m
+    id_sw     times the matched track id changed under an annotation
+    v_rmse    RMS error of tracked speed vs the annotation's differenced speed
+    v_bias    mean signed speed error; negative = real motion under-reported
+    pos_rmse  RMS position error against the annotation
+    stat_v95  95th pct speed of tracks never matched to a mover (the phantom)
+    stat_vmx  max of the same
+
 Metric columns:
     clus   mean clusters per frame        cstd   std of that count
     dN     mean |change in count| between frames (merge/split churn)
@@ -57,6 +87,7 @@ Metric columns:
 """
 import argparse
 import inspect
+import json
 import math
 import os
 import sys
@@ -273,8 +304,84 @@ def match_centroids(prev, cur, gate):
     return disp, len(prev) - len(matched_prev), len(cur) - len(matched_cur)
 
 
+def window_displacement(stamps, points, window=1.0):
+    """|p(t+window) - p(t)| for every sample that has a partner `window` later.
+
+    This is the discriminator between a genuinely translating object and a
+    static one whose centroid wanders: jitter accumulates path length but
+    returns near its origin, so its windowed displacement stays small while a
+    real mover's grows with its speed. Net start-to-end displacement cannot do
+    this job -- an obstacle carried out and back scores zero.
+    """
+    out = []
+    for i in range(len(stamps)):
+        j = int(np.searchsorted(stamps, stamps[i] + window))
+        if j < len(stamps):
+            out.append(float(np.linalg.norm(points[j] - points[i])))
+    return np.array(out)
+
+
+def classify_movers(trajectories, min_life=2.0, min_samples=10,
+                    mover_disp=0.5, window=1.0):
+    """Pick the confirmed tracks of a reference run that genuinely translated.
+
+    Returns a list of annotations [{id, t, x, y}]. These are *baseline-derived
+    annotations, not independent ground truth* -- the reference run decides
+    where and when an object moved. That is sound for comparing configurations
+    against each other (every configuration is scored against the same fixed
+    annotation set) but it cannot prove the reference run itself was right.
+    Hand-annotated truth still supersedes it.
+    """
+    movers = []
+    for tid, samples in trajectories.items():
+        if len(samples) < min_samples:
+            continue
+        stamps = np.array([s[0] for s in samples])
+        points = np.array([[s[1], s[2]] for s in samples])
+        if stamps[-1] - stamps[0] < min_life:
+            continue
+        disp = window_displacement(stamps, points, window)
+        if len(disp) and float(np.percentile(disp, 90)) >= mover_disp:
+            movers.append({'id': int(tid), 't': stamps.tolist(),
+                           'x': points[:, 0].tolist(), 'y': points[:, 1].tolist()})
+    return movers
+
+
+def sample_mover(mover, stamp):
+    """Interpolated (position, speed) of an annotation, or None if not live."""
+    stamps = mover['_t']
+    if stamp < stamps[0] or stamp > stamps[-1]:
+        return None
+    x = float(np.interp(stamp, stamps, mover['_x']))
+    y = float(np.interp(stamp, stamps, mover['_y']))
+    return np.array([x, y]), float(np.interp(stamp, stamps, mover['_speed']))
+
+
+def prepare_movers(movers, smooth=0.5):
+    """Attach interpolation arrays and a finite-difference speed to each mover.
+
+    Speed is differenced over a `smooth`-second baseline rather than between
+    adjacent samples: at 8.7 Hz an adjacent-sample difference is dominated by
+    the same centroid noise the tracker is being scored on.
+    """
+    prepared = []
+    for mover in movers:
+        stamps = np.asarray(mover['t'], dtype=float)
+        xs = np.asarray(mover['x'], dtype=float)
+        ys = np.asarray(mover['y'], dtype=float)
+        speed = np.zeros(len(stamps))
+        for i, stamp in enumerate(stamps):
+            lo = int(np.searchsorted(stamps, stamp - smooth / 2.0))
+            hi = min(int(np.searchsorted(stamps, stamp + smooth / 2.0)), len(stamps) - 1)
+            span = stamps[hi] - stamps[lo]
+            if span > 0:
+                speed[i] = math.hypot(xs[hi] - xs[lo], ys[hi] - ys[lo]) / span
+        prepared.append(dict(mover, _t=stamps, _x=xs, _y=ys, _speed=speed))
+    return prepared
+
+
 def replay(params, scans, gate=0.3, poses=None, injections=None, gt_gate=0.5,
-           gt_spinup=1.0):
+           gt_spinup=1.0, movers=None):
     """
     Run every scan through a fresh core and collect metrics.
 
@@ -289,8 +396,9 @@ def replay(params, scans, gate=0.3, poses=None, injections=None, gt_gate=0.5,
     core = LaserObstacleDetectorCore(**params)
 
     n_clusters, count_deltas, centroid_jumps, churn, speeds = [], [], [], [], []
-    prev_shape, track_flips, track_span, track_x = {}, {}, {}, {}
+    prev_shape, track_flips, track_span, track_pos = {}, {}, {}, {}
     track_speeds = {}
+    mover_matched_ids = set()
     prev_centroids = None
     prev_stamp = None
     injections = injections or []
@@ -301,6 +409,13 @@ def replay(params, scans, gate=0.3, poses=None, injections=None, gt_gate=0.5,
     gt_last_ids = [None] * len(injections)
     gt_pos_errors = []
     gt_v_errors = []
+    movers = prepare_movers(movers) if movers else []
+    mv_total = 0
+    mv_matches = 0
+    mv_id_switches = 0
+    mv_last_ids = [None] * len(movers)
+    mv_pos_errors = []
+    mv_v_errors = []
 
     for i, (stamp, ranges, angle_min, angle_inc) in enumerate(scans):
         # A scan whose ego pose could not be resolved is dropped rather than
@@ -369,6 +484,33 @@ def replay(params, scans, gate=0.3, poses=None, injections=None, gt_gate=0.5,
                 true_speed = math.hypot(target['vx'], target['vy'])
                 gt_v_errors.append(math.hypot(matched.x[2], matched.x[3]) - true_speed)
 
+        # Score against real-mover annotations. Same nearest-confirmed-track
+        # rule as the injected targets, so on a cluttered scene an unrelated
+        # track passing within gt_gate can be credited -- read mv_recall as a
+        # slight over-estimate, exactly as for injections.
+        for mover_index, mover in enumerate(movers):
+            sampled = sample_mover(mover, stamp)
+            if sampled is None:
+                continue
+            center, true_speed = sampled
+            mv_total += 1
+            if not confirmed:
+                continue
+            errors = [float(np.linalg.norm(track.x[:2] - center))
+                      for track in confirmed]
+            matched_index = int(np.argmin(errors))
+            if errors[matched_index] > gt_gate:
+                continue
+            matched = confirmed[matched_index]
+            mv_matches += 1
+            mv_pos_errors.append(errors[matched_index])
+            mover_matched_ids.add(matched.id)
+            previous_id = mv_last_ids[mover_index]
+            if previous_id is not None and previous_id != matched.id:
+                mv_id_switches += 1
+            mv_last_ids[mover_index] = matched.id
+            mv_v_errors.append(math.hypot(matched.x[2], matched.x[3]) - true_speed)
+
         n_clusters.append(len(clusters))
         cur_centroids = [np.mean(c, axis=0) for c in clusters]
         if pose is not None:
@@ -398,9 +540,9 @@ def replay(params, scans, gate=0.3, poses=None, injections=None, gt_gate=0.5,
             prev_shape[t.id] = t.shape_type
             track_flips.setdefault(t.id, 0)
             track_span[t.id] = track_span.get(t.id, 0.0) + dt
-            track_x.setdefault(t.id, []).append(t.x[0])
+            track_pos.setdefault(t.id, []).append((stamp, t.x[0], t.x[1]))
 
-    stds = [np.std(v) for v in track_x.values() if len(v) > 5]
+    stds = [np.std([p[1] for p in v]) for v in track_pos.values() if len(v) > 5]
     flip_rates = [track_flips[i] / track_span[i]
                   for i in track_flips if track_span.get(i, 0.0) > 1.0]
 
@@ -418,7 +560,10 @@ def replay(params, scans, gate=0.3, poses=None, injections=None, gt_gate=0.5,
         speed_p95=pct(speeds, 95),
         speed_max=float(np.max(speeds)) if speeds else 0.0,
         jitter_std_x=float(np.mean(stds)) if stds else 0.0,
-        n_tracks=len(track_x),
+        n_tracks=len(track_pos),
+        # Per-track (stamp, x, y) history in the tracking frame. Consumed by
+        # classify_movers() to derive mover annotations from a baseline run.
+        trajectories=track_pos,
         # Median confirmed-track lifetime. Under ego motion this is the metric
         # that moves: a planner that sees an obstacle re-IDed every 2 s cannot
         # reason about it, even when the per-frame geometry is fine.
@@ -432,6 +577,24 @@ def replay(params, scans, gate=0.3, poses=None, injections=None, gt_gate=0.5,
              for tid, v in track_speeds.items() if track_span.get(tid, 0.0) > 1.0),
             key=lambda r: -r[1]),
     )
+    if movers:
+        # The phantom side of the tradeoff, measured only over tracks that were
+        # never matched to a mover. Plain v95/vmax mix real and false velocity
+        # on a bag that contains both, so they cannot score a smoothing change:
+        # trusting measurements less lowers them by suppressing real motion too.
+        static_speeds = [v for tid, speeds_ in track_speeds.items()
+                         if tid not in mover_matched_ids for v in speeds_]
+        result.update(
+            mv_recall=mv_matches / mv_total if mv_total else 0.0,
+            mv_id_switches=mv_id_switches,
+            mv_v_rmse=float(np.sqrt(np.mean(np.square(mv_v_errors))))
+            if mv_v_errors else 0.0,
+            mv_v_bias=float(np.mean(mv_v_errors)) if mv_v_errors else 0.0,
+            mv_pos_rmse=float(np.sqrt(np.mean(np.square(mv_pos_errors))))
+            if mv_pos_errors else 0.0,
+            static_v95=pct(static_speeds, 95),
+            static_vmax=float(np.max(static_speeds)) if static_speeds else 0.0,
+        )
     if injections:
         result.update(
             gt_recall=gt_matches / gt_total if gt_total else 0.0,
@@ -456,6 +619,17 @@ def fmt(label, m):
             f"{m['centroid_jump_max']:>6.3f} {m['churn_rate']:>6.3f} "
             f"{m['flips_per_s']:>6.2f} {m['speed_p95']:>5.2f} {m['speed_max']:>5.2f} "
             f"{m['jitter_std_x']:>6.3f} {m['n_tracks']:>4d} {m['life_p50']:>5.1f}")
+
+
+MV_HEADER = (f"{'config':<34} {'recall':>7} {'id_sw':>6} {'v_rmse':>7} "
+             f"{'v_bias':>7} {'pos_rmse':>8} {'stat_v95':>8} {'stat_vmx':>8}")
+
+
+def fmt_mv(label, m):
+    return (f"{label:<34} {m['mv_recall']:>7.3f} {m['mv_id_switches']:>6d} "
+            f"{m['mv_v_rmse']:>7.3f} {m['mv_v_bias']:>7.3f} "
+            f"{m['mv_pos_rmse']:>8.3f} {m['static_v95']:>8.3f} "
+            f"{m['static_vmax']:>8.3f}")
 
 
 GT_HEADER = (f"{'config':<34} {'recall':>7} {'id_sw':>6} {'v_rmse':>7} "
@@ -512,6 +686,13 @@ def main():
     ap.add_argument('--inject', action='append', type=parse_injection, default=[],
                     metavar='x0=...,y0=...,vx=...,vy=...,r=...',
                     help='inject a moving circle defined in the tracking frame; repeatable')
+    ap.add_argument('--export-movers', metavar='PATH',
+                    help='classify the translating tracks of the baseline run and '
+                         'write them to PATH as mover annotations, then exit')
+    ap.add_argument('--movers-file', metavar='PATH',
+                    help='score every row against the mover annotations in PATH '
+                         '(written by --export-movers): velocity error on real '
+                         'motion plus phantom velocity on everything else')
     ap.add_argument('--limit', type=int, default=0, help='only first N scans')
     args = ap.parse_args()
 
@@ -540,10 +721,35 @@ def main():
         print(f'# sensor pose in {args.tracking_frame}: {ok}/{len(poses)} scans resolved',
               file=sys.stderr)
 
+    if args.export_movers:
+        reference = replay(baseline, scans, poses=poses)
+        annotations = classify_movers(reference['trajectories'])
+        # The producing configuration is stored so the scoring run can flag the
+        # row that generated the annotations: it necessarily scores itself
+        # perfectly (recall 1.000, pos_rmse 0.000) and is not evidence.
+        with open(args.export_movers, 'w') as handle:
+            json.dump({'reference_params': {k: v for k, v in baseline.items()},
+                       'movers': annotations}, handle)
+        print(f'# wrote {len(annotations)} mover annotations to {args.export_movers}',
+              file=sys.stderr)
+        return
+
+    movers = None
+    if args.movers_file:
+        with open(args.movers_file) as handle:
+            loaded = json.load(handle)
+        movers = loaded['movers']
+        reference_params = loaded.get('reference_params', {})
+        if reference_params == baseline:
+            baseline_label += ' [REFERENCE]'
+        print(f'# scoring against {len(movers)} mover annotations from '
+              f'{args.movers_file}', file=sys.stderr)
+
     print(HEADER)
-    base = replay(baseline, scans, poses=poses, injections=args.inject)
+    base = replay(baseline, scans, poses=poses, injections=args.inject, movers=movers)
     print(fmt(baseline_label, base))
     gt_rows = [(baseline_label, base)] if args.inject else []
+    mv_rows = [(baseline_label, base)] if movers else []
 
     for spec in args.sweep:
         name, vals = spec.split('=')
@@ -551,10 +757,12 @@ def main():
             val = coerce(name, v)
             label = f'{name}={val}'
             metrics = replay(apply(baseline, name, val), scans, poses=poses,
-                             injections=args.inject)
+                             injections=args.inject, movers=movers)
             print(fmt(label, metrics))
             if args.inject:
                 gt_rows.append((label, metrics))
+            if movers:
+                mv_rows.append((label, metrics))
 
     if args.kf_r:
         for v in args.kf_r.split(','):
@@ -563,12 +771,23 @@ def main():
             try:
                 label = f'kf_R=diag({float(v):.3f})'
                 metrics = replay(baseline, scans, poses=poses,
-                                 injections=args.inject)
+                                 injections=args.inject, movers=movers)
                 print(fmt(label, metrics))
                 if args.inject:
                     gt_rows.append((label, metrics))
+                if movers:
+                    mv_rows.append((label, metrics))
             finally:
                 core_mod.Track.update = original
+
+    if mv_rows:
+        print(f'\n{MV_HEADER}')
+        if any('[REFERENCE]' in label for label, _ in mv_rows):
+            print('# the [REFERENCE] row produced these annotations and scores '
+                  'itself perfectly by construction -- compare the other rows '
+                  'against each other, not against it', file=sys.stderr)
+        for label, metrics in mv_rows:
+            print(fmt_mv(label, metrics))
 
     if gt_rows:
         print(f'\n{GT_HEADER}')
